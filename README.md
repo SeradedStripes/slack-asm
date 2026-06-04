@@ -26,7 +26,7 @@ Requires:
 - Linux x86_64
 
 ```console
-$ nasm -f elf64 -o slack.o slack.s && ld -o slack slack.o
+$ nasm -f elf64 -o slack.o slack.asm && ld -o slack slack.o
 ```
 
 ## Target
@@ -38,7 +38,7 @@ $ nasm -f elf64 -o slack.o slack.s && ld -o slack slack.o
 ## Project structure
 
 ```
-slack.s          — entry point, main loop
+slack.asm        — entry point, main loop
 http.s           — HTTP request/response parsing & serialization
 tls/             — TLS 1.2/1.3 handshake & record layer (pure asm)
    handshake.s
