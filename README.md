@@ -25,6 +25,10 @@ Requires:
 - `ld` (GNU ld)
 - Linux x86_64
 
+```console
+$ nasm -f elf64 -o slack.o slack.s && ld -o slack slack.o
+```
+
 ## Target
 
 - **OS:** Linux (x86_64)
