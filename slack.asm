@@ -8,8 +8,7 @@ default rel
 
 %define STDOUT     1
 
-extern tls_init
-extern tls_client_start
+extern test_harness
 
 section .rodata
 banner:     db "slack-asm starting...", 10
@@ -33,14 +32,8 @@ _start:
 main:
     call print_banner
 
-    ; initialize TLS subsystem (stub)
-    call tls_init
-
-    ; test start a client (stub) against a dummy fd (0)
-    xor edi, edi                ; fd = 0 (stdin) -- placeholder
-    lea rsi, [rel banner]       ; hostname pointer (placeholder)
-    mov rdx, banner_len         ; hostname length
-    call tls_client_start
+    ; run the small test harness which builds sockaddr and exercises errno handling
+    call test_harness
 
     xor eax, eax
     ret
