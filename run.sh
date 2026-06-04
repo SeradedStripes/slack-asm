@@ -1,7 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-nasm -f elf64 -o slack.o slack.asm
-ld -o slack slack.o
+set -x
+
+# assemble all .asm files into .o
+for f in ./*.asm; do
+  [ -e "$f" ] || continue
+  obj="${f%%.asm}.o"
+  nasm -f elf64 -o "$obj" "$f"
+done
+
+# link all object files
+ld -o slack ./*.o
 
 ./slack

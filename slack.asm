@@ -8,6 +8,9 @@ default rel
 
 %define STDOUT     1
 
+extern tls_init
+extern tls_client_start
+
 section .rodata
 banner:     db "slack-asm starting...", 10
 banner_len: equ $ - banner
@@ -30,12 +33,14 @@ _start:
 main:
     call print_banner
 
-    ; TODO:
-    ; - load configuration
-    ; - open TCP socket
-    ; - negotiate TLS
-    ; - connect to Slack
-    ; - enter the event loop
+    ; initialize TLS subsystem (stub)
+    call tls_init
+
+    ; test start a client (stub) against a dummy fd (0)
+    xor edi, edi                ; fd = 0 (stdin) -- placeholder
+    lea rsi, [rel banner]       ; hostname pointer (placeholder)
+    mov rdx, banner_len         ; hostname length
+    call tls_client_start
 
     xor eax, eax
     ret
