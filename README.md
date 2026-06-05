@@ -14,10 +14,6 @@ A Slack bot written in **pure x86_64 Linux assembly**, no C, no Rust, no libc.
 Because it seemed like a good idea at the time.  
 Now im doing it for [Stardance](https://stardance.hackclub.com/projects/6658).
 
-## Status
-
-Nothing yet. This is the init commit.
-
 ## Building
 
 Requires:
@@ -39,13 +35,10 @@ $ nasm -f elf64 -o slack.o slack.asm && ld -o slack slack.o
 
 ```
 slack.asm        — entry point, main loop
-http.s           — HTTP request/response parsing & serialization
-tls/             — TLS 1.2/1.3 handshake & record layer (pure asm)
-   handshake.s
-   crypto.s
-   record.s
-socket.s         — socket(), connect(), send(), recv() wrappers
-json.s           — minimal JSON parser (enough for Slack messages)
+socket.asm       — socket(), connect(), send(), recv(), close() syscall wrappers
+tls.asm          — TLS 1.2 handshake & record layer (placeholder stubs)
+util.asm         — sockaddr_in construction, errno helpers
+test.asm         — test harness for the syscall / util layer
 ```
 
 ## Running the bot
