@@ -1,3 +1,5 @@
+; TLS code
+
 BITS 64
 default rel
 

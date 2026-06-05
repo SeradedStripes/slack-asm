@@ -1,4 +1,5 @@
 ; address construction and simple error handling helpers
+
 BITS 64
 default rel
 

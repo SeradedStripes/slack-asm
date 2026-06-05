@@ -1,3 +1,5 @@
+; The main entry point for slack-asm
+
 BITS 64
 
 default rel

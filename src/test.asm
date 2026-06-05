@@ -1,3 +1,5 @@
+; Tests for various components of the libraries implemeted in the repo.
+
 BITS 64
 default rel
 

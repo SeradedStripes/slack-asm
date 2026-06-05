@@ -1,3 +1,5 @@
+; Crypto primitives: SHA-256 and HMAC-SHA256
+
 BITS 64
 default rel
 
