@@ -13,6 +13,7 @@ section .text
 
 global sys_socket
 global sys_connect
+global sys_socketpair
 global sys_send
 global sys_recv
 global sys_close
@@ -45,6 +46,14 @@ sys_recv:
     mov r10, rcx
     xor r8, r8
     xor r9, r9
+    syscall
+    ret
+
+; int sys_socketpair(int domain, int type, int protocol, int sv[2])
+; rdi=domain, rsi=type, rdx=protocol, rcx=sv
+sys_socketpair:
+    mov rax, 53  ; SYS_socketpair
+    mov r10, rcx ; sv array pointer in r10 (per syscall convention)
     syscall
     ret
 

@@ -9,6 +9,15 @@ extern sha256_init
 extern sha256_update
 extern sha256_final
 extern hmac_sha256
+extern tls_init
+extern tls_send
+extern tls_recv
+extern sys_socketpair
+extern sys_send
+extern sys_recv
+extern sys_close
+
+%define TLS_APPLICATION_DATA 23
 
 section .rodata
 sock_ok:       db "socket ok", 10
@@ -287,6 +296,87 @@ test_harness:
     repe cmpsb
     jnz .fail
 
+    ; --- TLS record layer loopback test ---
+    push rbx
+    push rbp
+    sub rsp, 96
+    ; [rsp+0..3]   sv[0], sv[1]
+    ; [rsp+8]      tls_ctx (18 bytes, padded)
+    ; [rsp+40]     recv_type (1 byte)
+    ; [rsp+48]     recv_len (8 bytes)
+    ; [rsp+56]     recv_buf (40 bytes)
+
+    ; Create socketpair (AF_UNIX, SOCK_STREAM, 0, sv)
+    lea rcx, [rsp]
+    mov edi, 1
+    mov esi, 1
+    xor edx, edx
+    call sys_socketpair
+    test eax, eax
+    jnz .tls_fail
+
+    mov ebx, [rsp]          ; sv[0] write end
+    mov ebp, [rsp + 4]      ; sv[1] read end
+
+    ; Initialize TLS context
+    lea rdi, [rsp + 8]
+    call tls_init
+
+    ; Send "abc" as ApplicationData
+    lea rdi, [rsp + 8]
+    mov esi, ebx
+    mov edx, TLS_APPLICATION_DATA
+    lea rcx, [test_input]
+    mov r8, test_input_len
+    call tls_send
+    cmp rax, 0
+    jl .tls_fail
+
+    ; Receive TLS record via tls_recv
+    lea rdi, [rsp + 8]       ; ctx
+    mov esi, ebp             ; fd = sv[1]
+    lea rdx, [rsp + 40]     ; out_type
+    lea rcx, [rsp + 56]     ; out_data
+    lea r8, [rsp + 48]      ; out_len
+    call tls_recv
+    test eax, eax
+    jnz .tls_fail
+
+    ; Verify content type
+    cmp byte [rsp + 40], TLS_APPLICATION_DATA
+    jne .tls_fail
+
+    ; Verify data length
+    mov rax, [rsp + 48]
+    cmp rax, test_input_len
+    jne .tls_fail
+
+    ; Verify data content
+    lea rsi, [rsp + 56]
+    lea rdi, [test_input]
+    mov ecx, test_input_len
+    cld
+    repe cmpsb
+    jnz .tls_fail
+
+    ; Cleanup
+    mov edi, ebx
+    call sys_close
+    mov edi, ebp
+    call sys_close
+
+    add rsp, 96
+    pop rbp
+    pop rbx
+    jmp .tls_pass
+
+.tls_fail:
+    add rsp, 96
+    pop rbp
+    pop rbx
+    jmp .fail
+
+.tls_pass:
     mov rax, 1
     mov rdi, 1
     lea rsi, [rel msg_pass]
