@@ -13,7 +13,7 @@
 - [x] SHA-256 (pure assembly, tested with NIST vectors).
 - [x] HMAC-SHA256 (all RFC 4231 test cases pass, including key > block-size branch).
 - [x] TLS record layer (`tls_send`/`tls_recv`, loopback-tested via socketpair).
-- [ ] TLS 1.2 handshake, specifically ClientHello → ServerHello + Cert + ServerHelloDone.
+- [x] TLS 1.2 handshake, specifically ClientHello → ServerHello + Cert + ServerHelloDone (tested via fork+loopback).
 - [ ] TLS 1.3 support if required by Slack.
 - [ ] AES-CBC / AES-GCM, key derivation.
 - [ ] Certificate parsing (DER) and basic validation.

@@ -16,8 +16,10 @@ extern sys_socketpair
 extern sys_send
 extern sys_recv
 extern sys_close
+extern tls_client_start
 
 %define TLS_APPLICATION_DATA 23
+%define HS_DONE 3
 
 section .rodata
 sock_ok:       db "socket ok", 10
@@ -121,6 +123,35 @@ db 0x27, 0x63, 0x5f, 0xbc, 0xd5, 0xb0, 0xe9, 0x44
 db 0xbf, 0xdc, 0x63, 0x64, 0x4f, 0x07, 0x13, 0x93
 db 0x8a, 0x7f, 0x51, 0x53, 0x5c, 0x3a, 0x35, 0xe2
 
+; TLS server response for handshake test
+; TLS Record: Handshake(22), version 0x0303, length 96
+; Contains ServerHello + Certificate + ServerHelloDone
+server_resp:
+    ; TLS Record: Handshake(22), version 0x0303 (TLS 1.2), length 96
+    db 0x16, 0x03, 0x03, 0x00, 0x60
+    ; ServerHello (handshake msg type 2, body length 72)
+    db 0x02, 0x00, 0x00, 72
+    db 0x03, 0x03             ; version TLS 1.2
+    ; server random of 32 Bytes
+    db 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07
+    db 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f
+    db 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17
+    db 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f
+    db 32                     ; session_id length
+    times 32 db 0xaa          ; session_id
+    db 0x00, 0x2F             ; cipher suite: TLS_RSA_WITH_AES_128_CBC_SHA
+    db 0x00                   ; compression: null
+    db 0x00, 0x00             ; extensions length: 0
+    ; Certificate (handshake msg type 11, body length 12)
+    db 0x0B, 0x00, 0x00, 12
+    db 0x00, 0x00, 9          ; certificate list length
+    db 0x00, 0x00, 6          ; cert[0] length
+    db "CERT!!"               ; dummy certificate data
+    ; ServerHelloDone (handshake msg type 14, body length 0)
+    db 0x0E, 0x00, 0x00, 0
+server_resp_end:
+server_resp_len equ $ - server_resp
+
 msg_pass:     db "all tests passed", 10
 msg_pass_len: equ $ - msg_pass
 msg_fail:     db "test failed", 10
@@ -129,6 +160,7 @@ msg_fail_len: equ $ - msg_fail
 section .bss
 sha256_ctx: resb 104
 digest:     resb 32
+recv_buf:   resb 4096
 
 section .text
 global test_harness
@@ -299,12 +331,12 @@ test_harness:
     ; --- TLS record layer loopback test ---
     push rbx
     push rbp
-    sub rsp, 96
+    sub rsp, 200
     ; [rsp+0..3]   sv[0], sv[1]
-    ; [rsp+8]      tls_ctx (18 bytes, padded)
-    ; [rsp+40]     recv_type (1 byte)
-    ; [rsp+48]     recv_len (8 bytes)
-    ; [rsp+56]     recv_buf (40 bytes)
+    ; [rsp+8]      tls_ctx (118 bytes)
+    ; [rsp+128]    recv_type (1 byte)
+    ; [rsp+136]    recv_len (8 bytes)
+    ; [rsp+144]    recv_buf (40 bytes)
 
     ; Create socketpair (AF_UNIX, SOCK_STREAM, 0, sv)
     lea rcx, [rsp]
@@ -335,24 +367,24 @@ test_harness:
     ; Receive TLS record via tls_recv
     lea rdi, [rsp + 8]       ; ctx
     mov esi, ebp             ; fd = sv[1]
-    lea rdx, [rsp + 40]     ; out_type
-    lea rcx, [rsp + 56]     ; out_data
-    lea r8, [rsp + 48]      ; out_len
+    lea rdx, [rsp + 128]    ; out_type
+    lea rcx, [rsp + 144]    ; out_data
+    lea r8, [rsp + 136]     ; out_len
     call tls_recv
     test eax, eax
     jnz .tls_fail
 
     ; Verify content type
-    cmp byte [rsp + 40], TLS_APPLICATION_DATA
+    cmp byte [rsp + 128], TLS_APPLICATION_DATA
     jne .tls_fail
 
     ; Verify data length
-    mov rax, [rsp + 48]
+    mov rax, [rsp + 136]
     cmp rax, test_input_len
     jne .tls_fail
 
     ; Verify data content
-    lea rsi, [rsp + 56]
+    lea rsi, [rsp + 144]
     lea rdi, [test_input]
     mov ecx, test_input_len
     cld
@@ -365,13 +397,123 @@ test_harness:
     mov edi, ebp
     call sys_close
 
-    add rsp, 96
+    add rsp, 200
+    pop rbp
+    pop rbx
+
+    ; --- TLS handshake test (fork based loopback) ---
+    push rbx
+    push rbp
+    sub rsp, 144
+    ; [rsp+0..3]   sv[0], sv[1]
+    ; [rsp+8]      tls_ctx - 118 bytes
+    ; [rsp+128]    child status - 4 bytes
+
+    ; Create socketpair
+    lea rcx, [rsp]
+    mov edi, 1
+    mov esi, 1
+    xor edx, edx
+    call sys_socketpair
+    test eax, eax
+    jnz .hs_fail
+
+    mov ebx, [rsp]          ; sv[0] client end
+    mov ebp, [rsp + 4]      ; sv[1] server end
+
+    ; Fork
+    mov eax, 57             ; SYS_fork
+    syscall
+    test eax, eax
+    js .hs_fail             ; fork failed
+    jnz .hs_parent
+
+    ; --- Child process (TLS server) ---
+    ; Close client end
+    mov edi, ebx
+    call sys_close
+
+    ; Receive ClientHello
+    mov edi, ebp
+    lea rsi, [recv_buf]
+    mov edx, 4096
+    xor ecx, ecx
+    call sys_recv
+
+    ; Send server response
+    mov edi, ebp
+    lea rsi, [server_resp]
+    mov edx, server_resp_len
+    xor ecx, ecx
+    call sys_send
+
+    ; Close and exit
+    mov edi, ebp
+    call sys_close
+    xor edi, edi
+    mov eax, 60             ; SYS_exit
+    syscall
+
+.hs_parent:
+    ; --- Parent process (TLS client) ---
+    ; Close server end
+    mov edi, ebp
+    call sys_close
+
+    ; Initialize TLS context
+    lea rdi, [rsp + 8]
+    call tls_init
+
+    ; Run handshake
+    lea rdi, [rsp + 8]      ; ctx
+    mov esi, ebx            ; fd
+    xor edx, edx            ; hostname = NULL
+    xor ecx, ecx            ; hostlen = 0
+    call tls_client_start
+    test eax, eax
+    jnz .hs_fail
+
+    ; Verify handshake completed
+    lea rdi, [rsp + 8]
+    cmp byte [rdi + 117], HS_DONE            ; tls_ctx.hs_state
+    jne .hs_fail
+
+    ; Verify cipher suite was parsed (TLS_RSA_WITH_AES_128_CBC_SHA = 0x002F)
+    lea rdi, [rsp + 8]
+    mov ax, [rdi + 115]            ; tls_ctx.cipher_suite
+    cmp ax, 0x002F
+    jne .hs_fail
+
+    ; Verify session_id was parsed
+    lea rdi, [rsp + 8]
+    cmp byte [rdi + 114], 32        ; tls_ctx.session_id_len
+    jne .hs_fail
+
+    ; Wait for child to finish
+    mov edi, -1              ; any child
+    xor esi, esi             ; NULL status
+    xor edx, edx             ; no options
+    xor r10d, r10d           ; no rusage
+    mov eax, 61              ; SYS_wait4
+    syscall
+
+    ; Cleanup
+    mov edi, ebx
+    call sys_close
+
+    add rsp, 144
     pop rbp
     pop rbx
     jmp .tls_pass
 
+.hs_fail:
+    add rsp, 144
+    pop rbp
+    pop rbx
+    jmp .fail
+
 .tls_fail:
-    add rsp, 96
+    add rsp, 200
     pop rbp
     pop rbx
     jmp .fail

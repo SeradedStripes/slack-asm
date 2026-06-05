@@ -17,19 +17,39 @@ TLS_ALERT              equ 21
 TLS_HANDSHAKE          equ 22
 TLS_APPLICATION_DATA   equ 23
 
+; Handshake message types (RFC 5246 §7.4)
+HS_CLIENT_HELLO        equ 1
+HS_SERVER_HELLO        equ 2
+HS_CERTIFICATE         equ 11
+HS_SERVER_HELLO_DONE   equ 14
+
+; Handshake client states
+HS_WAIT_SERVER_HELLO      equ 0
+HS_WAIT_CERTIFICATE       equ 1
+HS_WAIT_SERVER_HELLO_DONE equ 2
+HS_DONE                   equ 3
+
 TLS_VERSION_MAJOR equ 3
 TLS_VERSION_MINOR equ 3
 
 struc tls_ctx
-    .write_seq resq 1
-    .read_seq  resq 1
-    .version   resw 1
+    .write_seq      resq 1    ; 0-7
+    .read_seq       resq 1    ; 8-15
+    .version        resw 1    ; 16-17
+    .client_random  resb 32   ; 18-49
+    .server_random  resb 32   ; 50-81
+    .session_id     resb 32   ; 82-113
+    .session_id_len resb 1    ; 114
+    .cipher_suite   resw 1    ; 115-116
+    .hs_state       resb 1    ; 117
 endstruc
+tls_ctx_size equ 118
 
 extern sys_send, sys_recv
 
 section .bss
 header_buf:  resb TLS_HEADER_SIZE
+hs_buf:  resb 4096
 
 section .text
 global tls_init
@@ -228,9 +248,322 @@ _read_exactly:
     pop r12
     ret
 
-; int tls_client_start(int fd, const char *hostname, uint64_t hostlen)
-; Initiates a TLS handshake. Stub for now.
-; rdi = fd, rsi = hostname, rdx = hostlen
+; int tls_client_start(struct tls_ctx *ctx, int fd,
+;                       const char *hostname, uint64_t hostlen)
+; rdi = ctx, esi = fd, rdx = hostname, rcx = hostlen
 tls_client_start:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 16
+    ; rsp+0:  recv_len (8 bytes)
+    ; rsp+8:  recv_type (1 byte)
+
+    mov r12, rdi            ; ctx
+    mov r13d, esi           ; fd
+
+    ; Set initial handshake state
+    mov byte [r12 + tls_ctx.hs_state], HS_WAIT_SERVER_HELLO
+
+    ; Generate 32 bytes of client random via getrandom (SYS 318)
+    lea rdi, [r12 + tls_ctx.client_random]
+    mov esi, 32
+    xor edx, edx
+    mov eax, 318
+    syscall
+
+    ; Build ClientHello in hs_buf
+    lea rsi, [rel hs_buf]
+    mov rdi, r12
+    call _build_client_hello
+    ; rax = message length (49)
+    test rax, rax
+    js .tcs_error
+
+    ; Send as TLS Handshake record
+    mov rdi, r12
+    mov esi, r13d
+    mov edx, TLS_HANDSHAKE
+    lea rcx, [rel hs_buf]
+    mov r8, rax
+    call tls_send
+    test rax, rax
+    js .tcs_error
+
+    ; --- Main handshake receive loop ---
+.tcs_recv_loop:
+    lea rdx, [rsp + 8]      ; out_type
+    lea rcx, [rel hs_buf]   ; out_data
+    lea r8, [rsp]           ; out_len
+    mov rdi, r12
+    mov esi, r13d
+    call tls_recv
+    test eax, eax
+    jnz .tcs_error
+
+    ; Must be a Handshake record
+    cmp byte [rsp + 8], TLS_HANDSHAKE
+    jne .tcs_error
+
+    ; Parse all handshake messages in this fragment thingy
+    lea r14, [hs_buf]       ; position pointer
+    mov r15, [rsp]          ; remaining bytes
+
+.tcs_parse_loop:
+    cmp r15, 4
+    jb .tcs_next_recv       ; need more data
+
+    ; Read handshake message header
+    movzx eax, byte [r14]           ; msg_type
+    movzx ebx, byte [r14 + 1]
+    shl ebx, 16
+    movzx ecx, byte [r14 + 2]
+    shl ecx, 8
+    or ebx, ecx
+    movzx ecx, byte [r14 + 3]
+    or ebx, ecx                     ; ebx = message body length
+
+    ; Total message size (including 4-byte header)
+    lea ecx, [ebx + 4]
+    cmp r15, rcx
+    jb .tcs_next_recv               ; incomplete message
+
+    ; Dispatch based on current handshake state
+    movzx edx, byte [r12 + tls_ctx.hs_state]
+
+    cmp dl, HS_WAIT_SERVER_HELLO
+    je .tcs_handle_sh
+
+    cmp dl, HS_WAIT_CERTIFICATE
+    je .tcs_handle_cert
+
+    cmp dl, HS_WAIT_SERVER_HELLO_DONE
+    je .tcs_handle_shd
+
+    jmp .tcs_error
+
+.tcs_handle_sh:
+    cmp al, HS_SERVER_HELLO
+    jne .tcs_error
+
+    ; Parse ServerHello body
+    lea rsi, [r14 + 4]
+    mov edx, ebx
+    mov rdi, r12
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbx
+    call _parse_server_hello
+    pop rbx
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    test eax, eax
+    jnz .tcs_error
+
+    mov byte [r12 + tls_ctx.hs_state], HS_WAIT_CERTIFICATE
+    jmp .tcs_advance
+
+.tcs_handle_cert:
+    cmp al, HS_CERTIFICATE
+    jne .tcs_error
+
+    ; Skip Certificate body for now (Might do it later)
+    mov byte [r12 + tls_ctx.hs_state], HS_WAIT_SERVER_HELLO_DONE
+    jmp .tcs_advance
+
+.tcs_handle_shd:
+    cmp al, HS_SERVER_HELLO_DONE
+    jne .tcs_error
+
+    ; ServerHelloDone body must be empty aka length = 0
+    test ebx, ebx
+    jnz .tcs_error
+
+    mov byte [r12 + tls_ctx.hs_state], HS_DONE
+    jmp .tcs_advance
+
+.tcs_advance:
+    lea ecx, [ebx + 4]              ; total current message size
+    sub r15, rcx
+    add r14, rcx
+
+    ; Check if handshake complete
+    cmp byte [r12 + tls_ctx.hs_state], HS_DONE
+    je .tcs_done
+
+    test r15, r15
+    jnz .tcs_parse_loop             ; more messages in this fragment
+
+.tcs_next_recv:
+    jmp .tcs_recv_loop              ; get next TLS record
+
+.tcs_done:
     xor eax, eax
+    jmp .tcs_return
+
+.tcs_error:
+    or eax, -1
+
+.tcs_return:
+    add rsp, 16
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+
+
+; Build a ClientHello handshake message (RFC 5246 §7.4.1.2).
+; rdi = ctx, rsi = output buffer
+; Returns total message length in rax (49 bytes).
+; Clobbers only caller-saved registers (rax, rcx, rdx, rdi, rsi, r8-r11).
+_build_client_hello:
+    cmp byte [rdi + tls_ctx.hs_state], 0
+    mov rax, -1
+    js .bch_error
+
+    push r8
+    push r9
+    push r10
+    push r11
+
+    ; Handshake header
+    mov byte [rsi], HS_CLIENT_HELLO
+    mov byte [rsi + 1], 0          ; length hi = 0
+    mov byte [rsi + 2], 0          ; length mid = 0
+    mov byte [rsi + 3], 45         ; length lo = 45 (body size)
+
+    ; Protocol version: TLS 1.2 (0x0303)
+    mov word [rsi + 4], 0x0303
+
+    ; Client random (32 bytes at ctx offset of 18)
+    mov r8, [rdi + tls_ctx.client_random]
+    mov [rsi + 6], r8
+    mov r8, [rdi + tls_ctx.client_random + 8]
+    mov [rsi + 14], r8
+    mov r8, [rdi + tls_ctx.client_random + 16]
+    mov [rsi + 22], r8
+    mov r8, [rdi + tls_ctx.client_random + 24]
+    mov [rsi + 30], r8
+
+    ; Session ID length is 0
+    mov byte [rsi + 38], 0
+
+    ; Cipher suites length is 4 (big-endian)
+    mov word [rsi + 39], 0x0004
+
+    ; Cipher suite 1: TLS_RSA_WITH_AES_128_CBC_SHA (0x002F)
+    mov word [rsi + 41], 0x002F
+    ; Cipher suite 2: TLS_RSA_WITH_AES_256_CBC_SHA (0x0035)
+    mov word [rsi + 43], 0x0035
+
+    ; Compression methods length is 1
+    mov byte [rsi + 45], 1
+    ; Compression method: null (0x00)
+    mov byte [rsi + 46], 0
+
+    ; Extensions length is 0
+    mov word [rsi + 47], 0
+
+    mov eax, 49                   ; total message length
+
+.bch_return:
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    ret
+
+.bch_error:
+    mov eax, -1
+    jmp .bch_return
+
+
+; Parse ServerHello body and update ctx fields (RFC 5246 §7.4.1.3).
+; rdi = ctx, rsi = body pointer, rdx = body length
+; Returns 0 on success, negative on error.
+; Clobbers only caller-saved registers (rax, rcx, rdx, rdi, rsi, r8-r11).
+_parse_server_hello:
+    cmp rdx, 35
+    jb .psh_error
+
+    push r8
+    push r9
+    push r10
+    push r11
+
+    ; Save ctx and body pointer
+    mov r10, rdi                 ; ctx
+    mov r11, rsi                 ; body pointer
+
+    ; Version at [r11+0] (2 bytes) - skip for now
+
+    ; Copy server random: body bytes 2-33 → ctx.server_random
+    mov r8, [r11 + 2]
+    mov [r10 + tls_ctx.server_random], r8
+    mov r8, [r11 + 10]
+    mov [r10 + tls_ctx.server_random + 8], r8
+    mov r8, [r11 + 18]
+    mov [r10 + tls_ctx.server_random + 16], r8
+    mov r8, [r11 + 26]
+    mov [r10 + tls_ctx.server_random + 24], r8
+
+    ; Session ID length at body offset of 34 (after 2-byte version + 32-byte random)
+    movzx eax, byte [r11 + 34]
+    mov [r10 + tls_ctx.session_id_len], al
+
+    mov ecx, 35                    ; current offset in body
+
+    test al, al
+    jz .psh_no_sid
+
+    cmp al, 32
+    ja .psh_error
+
+    ; Copy session ID (al = length)
+    movzx ecx, al
+    lea rdi, [r10 + tls_ctx.session_id]
+    push rsi
+    mov rsi, r11
+    add rsi, 35                    ; source = body + 35
+    rep movsb
+    pop rsi
+
+    ; Advance offset past session ID
+    movzx eax, byte [r10 + tls_ctx.session_id_len]
+    lea ecx, [eax + 35]
+
+.psh_no_sid:
+    ; Cipher suite (2 bytes, big-endian) at body offset ecx
+    mov ax, [r11 + rcx]
+    xchg al, ah                    ; big-endian → host order
+    mov [r10 + tls_ctx.cipher_suite], ax
+    lea ecx, [rcx + 2]             ; past cipher suite
+
+    ; Compression method (1 byte) - skip
+    lea ecx, [rcx + 1]
+
+    ; Extensions - skip entirely for now
+    ; (if body has more data, it's extensions we don't parse it)
+
+    xor eax, eax
+    jmp .psh_return
+
+.psh_error:
+    or eax, -1
+
+.psh_return:
+    pop r11
+    pop r10
+    pop r9
+    pop r8
     ret
