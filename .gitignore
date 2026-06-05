@@ -1,1 +1,8 @@
+# Object files
 **/*.o
+
+# Build Binaries
+**/slack
+
+# Keep ASM code
+!**/*.asm

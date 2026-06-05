@@ -1,5 +1,5 @@
-SOURCES := $(wildcard *.asm)
-OBJS := $(SOURCES:.asm=.o)
+SOURCES := $(wildcard src/*.asm)
+OBJS := $(patsubst src/%.asm,src/%.o,$(SOURCES))
 
 NASM := nasm
 NASMFLAGS := -f elf64

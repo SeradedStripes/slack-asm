@@ -4,13 +4,13 @@ set -euo pipefail
 set -x
 
 # assemble all .asm files into .o
-for f in ./*.asm; do
+for f in ./src/*.asm; do
   [ -e "$f" ] || continue
   obj="${f%%.asm}.o"
   nasm -f elf64 -o "$obj" "$f"
 done
 
 # link all object files
-ld -o slack ./*.o
+ld -o slack ./src/*.o
 
 ./slack
