@@ -32,6 +32,7 @@ global sha256_init
 global sha256_update
 global sha256_final
 global sha256_transform
+global hmac_sha256
 
 ; sha256_init(void *ctx)
 sha256_init:
@@ -96,6 +97,7 @@ sha256_update:
     mov rax, rbp
     shr rax, 6
     jz .u_tail
+    mov rbx, rax
 
 .u_block:
     mov rdi, r12
@@ -103,7 +105,7 @@ sha256_update:
     call sha256_transform
     add r13, 64
     sub rbp, 64
-    sub rax, 1
+    sub rbx, 1
     jnz .u_block
 
 .u_tail:
@@ -338,4 +340,130 @@ memcpy_internal:
     mov rcx, rdx
     cld
     rep movsb
+    ret
+
+; hmac_sha256(const void *key, size_t key_len,
+;            const void *msg, size_t msg_len,
+;            void *mac)
+; rdi=key, rsi=key_len, rdx=msg, rcx=msg_len, r8=mac
+; More programming languages should have a commenting style like this
+hmac_sha256:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 240
+
+    mov r12, rdi
+    mov r13, rsi
+    mov r14, rdx
+    mov r15, rcx
+    mov [rsp + 232], r8
+
+    lea rbp, [rsp]           ; rbp = K' buffer of 64 bytes
+
+    cmp r13, 64
+    ja .hash_key
+
+    mov rdi, rbp
+    mov rsi, r12
+    mov rdx, r13
+    call memcpy_internal
+
+    mov rdi, rbp
+    add rdi, r13
+    mov rcx, 64
+    sub rcx, r13
+    xor eax, eax
+    cld
+    rep stosb
+    jmp .xor_ipad
+
+.hash_key:
+    lea rdi, [rsp + 64]
+    call sha256_init
+    mov rdi, rsp
+    add rdi, 64
+    mov rsi, r12
+    mov rdx, r13
+    call sha256_update
+    mov rdi, rsp
+    add rdi, 64
+    lea rsi, [rsp + 168]
+    call sha256_final
+
+    lea rdi, [rbp]
+    lea rsi, [rsp + 168]
+    mov rdx, 32
+    call memcpy_internal
+    xor eax, eax
+    lea rdi, [rbp + 32]
+    mov ecx, 32
+    cld
+    rep stosb
+
+.xor_ipad:
+    xor ecx, ecx
+.xor_ipad_loop:
+    mov rax, [rbp + rcx]
+    mov rbx, 0x3636363636363636
+    xor rax, rbx
+    mov [rbp + rcx], rax
+    add rcx, 8
+    cmp rcx, 64
+    jb .xor_ipad_loop
+
+    lea rdi, [rsp + 64]
+    call sha256_init
+    mov rdi, rsp
+    add rdi, 64
+    mov rsi, rbp
+    mov rdx, 64
+    call sha256_update
+    mov rdi, rsp
+    add rdi, 64
+    mov rsi, r14
+    mov rdx, r15
+    call sha256_update
+    mov rdi, rsp
+    add rdi, 64
+    lea rsi, [rsp + 168]
+    call sha256_final
+
+    xor ecx, ecx
+.xor_opad_loop:
+    mov rax, [rbp + rcx]
+    mov rbx, 0x6a6a6a6a6a6a6a6a
+    xor rax, rbx
+    mov [rbp + rcx], rax
+    add rcx, 8
+    cmp rcx, 64
+    jb .xor_opad_loop
+
+    lea rdi, [rsp + 64]
+    call sha256_init
+    mov rdi, rsp
+    add rdi, 64
+    mov rsi, rbp
+    mov rdx, 64
+    call sha256_update
+    mov rdi, rsp
+    add rdi, 64
+    lea rsi, [rsp + 168]
+    mov rdx, 32
+    call sha256_update
+    mov rdi, rsp
+    add rdi, 64
+    mov rsi, [rsp + 232]
+    call sha256_final
+
+    add rsp, 240
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
     ret

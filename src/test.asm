@@ -8,6 +8,7 @@ extern sys_close
 extern sha256_init
 extern sha256_update
 extern sha256_final
+extern hmac_sha256
 
 section .rodata
 sock_ok:       db "socket ok", 10
@@ -29,6 +30,17 @@ db 0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad
 
 test_input:     db "abc"
 test_input_len: equ $ - test_input
+
+; HMAC-SHA256 test case - RFC 4231 Test Case 1
+hmac_key1:    times 20 db 0x0b
+hmac_key1_len: equ $ - hmac_key1
+hmac_msg1:    db "Hi There"
+hmac_msg1_len: equ $ - hmac_msg1
+hmac_expected1:
+db 0xb0, 0x34, 0x4c, 0x61, 0xd8, 0xdb, 0x38, 0x53
+db 0x5c, 0xa8, 0xaf, 0xce, 0xaf, 0x0b, 0xf1, 0x2b
+db 0x88, 0x1d, 0xc2, 0x00, 0xc9, 0x83, 0x3d, 0xa7
+db 0x26, 0xe9, 0x37, 0x6c, 0x2e, 0x32, 0xcf, 0xf7
 
 msg_pass:     db "all tests passed", 10
 msg_pass_len: equ $ - msg_pass
@@ -102,6 +114,20 @@ test_harness:
 
     lea rsi, [digest]
     lea rdi, [expected_abc]
+    mov ecx, 32
+    cld
+    repe cmpsb
+    jnz .fail
+
+    lea rdi, [hmac_key1]
+    mov rsi, hmac_key1_len
+    lea rdx, [hmac_msg1]
+    mov rcx, hmac_msg1_len
+    lea r8, [digest]
+    call hmac_sha256
+
+    lea rsi, [digest]
+    lea rdi, [hmac_expected1]
     mov ecx, 32
     cld
     repe cmpsb
