@@ -10,10 +10,11 @@
 - Helpers for `sockaddr_in` construction and errno capture.
 
 ## [ ] Phase 3: TLS (in progress)
+- [x] SHA-256 (pure assembly, tested with NIST vectors).
 - [ ] TLS record layer, specifically read/write TLSPlaintext records.
 - [ ] TLS 1.2 handshake, specifically ClientHello → ServerHello + Cert + ServerHelloDone.
 - [ ] TLS 1.3 support if required by Slack.
-- [ ] Minimal crypto primitives: AES-CBC / AES-GCM, SHA-256, HMAC, key derivation.
+- [ ] HMAC-SHA256, AES-CBC / AES-GCM, key derivation.
 - [ ] Certificate parsing (DER) and basic validation.
 - [ ] Integrate with socket layer so all Slack traffic is tunneled over TLS.
 
