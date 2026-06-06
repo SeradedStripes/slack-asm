@@ -50,6 +50,12 @@ tls_ctx_size equ 118
 extern sys_send, sys_recv
 extern hmac_sha256
 
+section .rodata
+master_label:       db "master secret"
+master_label_len:   equ $ - master_label
+key_expansion_label: db "key expansion"
+key_expansion_label_len: equ $ - key_expansion_label
+
 section .bss
 header_buf:  resb TLS_HEADER_SIZE
 hs_buf:  resb 4096
@@ -57,6 +63,11 @@ prf_seed_buf: resb 512
 prf_abuf:     resb 32
 prf_inbuf:    resb 544
 prf_outbuf:   resb 32
+master_secret:     resb 48
+client_write_key:  resb 16
+server_write_key:  resb 16
+client_write_iv:   resb 4
+server_write_iv:   resb 4
 
 section .text
 global tls_init
@@ -64,6 +75,12 @@ global tls_send
 global tls_recv
 global tls_client_start
 global tls_prf
+global tls_derive_keys
+global master_secret
+global client_write_key
+global server_write_key
+global client_write_iv
+global server_write_iv
 
 ; void tls_init(struct tls_ctx *ctx)
 ; rdi = ctx pointer
@@ -691,6 +708,106 @@ tls_prf:
     jmp .prf_loop
 
 .prf_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+
+; Derive master secret and key block from pre-master secret.
+; void tls_derive_keys(struct tls_ctx *ctx,
+;                       const void *pre_master_secret, uint64_t pre_master_len)
+; rdi = ctx, rsi = pre_master_secret, rdx = pre_master_len
+; Result stored in BSS: master_secret, client_write_key, server_write_key,
+;                       client_write_iv, server_write_iv
+tls_derive_keys:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov r12, rdi            ; ctx
+    mov r13, rsi            ; pre_master_secret
+    mov r14, rdx            ; pre_master_len
+
+    ; Build seed = client_random + server_random in hs_buf.
+    ; Note: must NOT use prf_seed_buf - tls_prf uses it internally
+    ; for (label + seed) construction, and if seed pointer overlaps
+    ; with prf_seed_buf, the label copy corrupts the source seed.
+    lea rdi, [rel hs_buf]
+    lea rsi, [r12 + tls_ctx.client_random]
+    mov rcx, 32
+    cld
+    rep movsb
+
+    lea rsi, [r12 + tls_ctx.server_random]
+    mov rcx, 32
+    rep movsb
+
+    ; PRF(pre_master, "master secret", seed, master_secret, 48)
+    mov rdi, r13
+    mov rsi, r14
+    lea rdx, [rel master_label]
+    mov rcx, master_label_len
+    lea r8, [rel hs_buf]
+    mov r9, 64
+    lea rax, [rel master_secret]
+    push 48
+    push rax
+    call tls_prf
+    add rsp, 16
+
+    ; Build seed = server_random + client_random in hs_buf
+    lea rdi, [rel hs_buf]
+    lea rsi, [r12 + tls_ctx.server_random]
+    mov rcx, 32
+    cld
+    rep movsb
+
+    lea rsi, [r12 + tls_ctx.client_random]
+    mov rcx, 32
+    rep movsb
+
+    ; PRF(master_secret, "key expansion", seed, hs_buf + 64, 40)
+    lea rdi, [rel master_secret]
+    mov rsi, 48
+    lea rdx, [rel key_expansion_label]
+    mov rcx, key_expansion_label_len
+    lea r8, [rel hs_buf]
+    mov r9, 64
+    lea rax, [rel hs_buf + 64]
+    push 40
+    push rax
+    call tls_prf
+    add rsp, 16
+
+    ; Extract keys from key block at hs_buf + 64
+    lea rsi, [rel hs_buf + 64]
+    lea rdi, [rel client_write_key]
+    mov rcx, 16
+    cld
+    rep movsb
+
+    lea rsi, [rel hs_buf + 80]
+    lea rdi, [rel server_write_key]
+    mov rcx, 16
+    rep movsb
+
+    lea rsi, [rel hs_buf + 96]
+    lea rdi, [rel client_write_iv]
+    mov rcx, 4
+    rep movsb
+
+    lea rsi, [rel hs_buf + 100]
+    lea rdi, [rel server_write_iv]
+    mov rcx, 4
+    rep movsb
+
+    xor eax, eax
     pop r15
     pop r14
     pop r13
