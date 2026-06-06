@@ -283,9 +283,10 @@ tls_client_start:
     push r13
     push r14
     push r15
-    sub rsp, 16
+    sub rsp, 80
     ; rsp+0:  recv_len (8 bytes)
     ; rsp+8:  recv_type (1 byte)
+    ; rsp+16: pre_master_secret (48 bytes)
 
     mov r12, rdi            ; ctx
     mov r13d, esi           ; fd
@@ -430,6 +431,19 @@ tls_client_start:
     jmp .tcs_recv_loop              ; get next TLS record
 
 .tcs_done:
+    ; Generate pre_master_secret: 0x0303 + 46 random bytes
+    mov word [rsp + 16], 0x0303
+    lea rdi, [rsp + 18]
+    mov esi, 46
+    xor edx, edx
+    mov eax, 318              ; getrandom
+    syscall
+
+    mov rdi, r12
+    lea rsi, [rsp + 16]
+    mov edx, 48
+    call tls_derive_keys
+
     xor eax, eax
     jmp .tcs_return
 
@@ -437,7 +451,7 @@ tls_client_start:
     or eax, -1
 
 .tcs_return:
-    add rsp, 16
+    add rsp, 80
     pop r15
     pop r14
     pop r13
