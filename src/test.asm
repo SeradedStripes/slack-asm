@@ -19,6 +19,7 @@ extern sys_send
 extern sys_recv
 extern sys_close
 extern tls_client_start
+extern tls_prf
 
 %define TLS_APPLICATION_DATA 23
 %define HS_DONE 3
@@ -159,10 +160,45 @@ msg_pass_len: equ $ - msg_pass
 msg_fail:     db "test failed", 10
 msg_fail_len: equ $ - msg_fail
 
+; PRF test vectors (from Python a reference)
+prf_secret:      db "secret"
+prf_secret_len:  equ $ - prf_secret
+prf_label:       db "test label"
+prf_label_len:   equ $ - prf_label
+prf_seed:        db "seed1234"
+prf_seed_len:    equ $ - prf_seed
+
+prf_expected_32:
+db 0x2c, 0x02, 0xf9, 0xaf, 0xb0, 0x8a, 0x8b, 0x4b
+db 0x31, 0x25, 0x14, 0x13, 0xf8, 0x3d, 0xea, 0x67
+db 0xa2, 0x71, 0x18, 0x0b, 0x42, 0xe7, 0x18, 0xac
+db 0xfe, 0x24, 0x5f, 0x9e, 0xa7, 0x39, 0x4c, 0xe9
+
+prf_expected_48:
+db 0x2c, 0x02, 0xf9, 0xaf, 0xb0, 0x8a, 0x8b, 0x4b
+db 0x31, 0x25, 0x14, 0x13, 0xf8, 0x3d, 0xea, 0x67
+db 0xa2, 0x71, 0x18, 0x0b, 0x42, 0xe7, 0x18, 0xac
+db 0xfe, 0x24, 0x5f, 0x9e, 0xa7, 0x39, 0x4c, 0xe9
+db 0xd2, 0x74, 0x51, 0xb9, 0x2f, 0xb0, 0x7b, 0xaa
+db 0x83, 0xcb, 0xf1, 0x7e, 0x10, 0x5c, 0x35, 0xf2
+
+prf_a1_expected:
+db 0x7f, 0x10, 0xac, 0xcc, 0x13, 0xae, 0x22, 0x2f
+db 0x8d, 0x23, 0x41, 0x33, 0x18, 0x29, 0xd5, 0x0b
+db 0x32, 0x07, 0xae, 0x41, 0xf3, 0x9f, 0xe1, 0xdd
+db 0x7a, 0x49, 0xb5, 0xad, 0xee, 0x7a, 0xf2, 0xc9
+
+prf_a2_expected:
+db 0x6f, 0x45, 0xb9, 0xd9, 0x33, 0x59, 0x71, 0x5e
+db 0x8e, 0xd3, 0xde, 0x79, 0xc1, 0x4b, 0x6a, 0x68
+db 0x40, 0x3b, 0x6d, 0x78, 0xb0, 0x4f, 0x4d, 0x2e
+db 0x1e, 0xfa, 0xd1, 0xb8, 0x36, 0xc4, 0x6d, 0xd7
+
 section .bss
 sha256_ctx: resb 104
 digest:     resb 32
 recv_buf:   resb 4096
+prf_out:    resb 64
 
 section .text
 global test_harness
@@ -326,6 +362,176 @@ test_harness:
     lea rsi, [digest]
     lea rdi, [hmac_expected7]
     mov ecx, 32
+    cld
+    repe cmpsb
+    jnz .fail
+
+    ; --- PRF intermediate value tests ---
+    ; Build seed_buf on stack = label + seed
+    sub rsp, 128
+    lea rdi, [rsp]
+    lea rsi, [rel prf_label]
+    mov rcx, prf_label_len
+    cld
+    rep movsb
+    lea rsi, [rel prf_seed]
+    mov rcx, prf_seed_len
+    rep movsb
+
+    ; Compute A(1) = HMAC(secret, seed_buf)
+    lea rdi, [rel prf_secret]
+    mov rsi, prf_secret_len
+    mov rdx, rsp
+    mov rcx, prf_label_len
+    add rcx, prf_seed_len
+    lea r8, [rsp + 64]
+    call hmac_sha256
+
+    lea rsi, [rsp + 64]
+    lea rdi, [rel prf_a1_expected]
+    mov ecx, 32
+    cld
+    repe cmpsb
+    jne .prf_abort
+
+    ; Compute A(2) = HMAC(secret, A1)
+    lea rdi, [rel prf_secret]
+    mov rsi, prf_secret_len
+    lea rdx, [rsp + 64]
+    mov rcx, 32
+    lea r8, [rsp + 96]
+    call hmac_sha256
+
+    lea rsi, [rsp + 96]
+    lea rdi, [rel prf_a2_expected]
+    mov ecx, 32
+    cld
+    repe cmpsb
+    jne .prf_abort
+    add rsp, 128
+    jmp .prf_intermediate_ok
+
+.prf_abort:
+    add rsp, 128
+    jmp .fail
+
+.prf_intermediate_ok:
+
+    ; --- PRF test ---
+    ; --- Direct iteration 1 test ---
+    ; This tests: iter1 = HMAC(secret, A(1) + seed_buf)
+    sub rsp, 128
+
+    ; Build seed_buf on stack
+    lea rdi, [rsp]
+    lea rsi, [rel prf_label]
+    mov rcx, prf_label_len
+    cld
+    rep movsb
+    lea rsi, [rel prf_seed]
+    mov rcx, prf_seed_len
+    rep movsb                     ; rsp[0..17] = seed_buf
+
+    ; Compute A(1) = HMAC(secret, seed_buf)
+    lea rdi, [rel prf_secret]
+    mov rsi, prf_secret_len
+    mov rdx, rsp
+    mov rcx, prf_label_len
+    add rcx, prf_seed_len
+    lea r8, [rsp + 32]           ; A(1) at rsp+32
+    call hmac_sha256
+
+    ; Build inbuf = A(1) + seed_buf at rsp+64
+    lea rdi, [rsp + 64]
+    lea rsi, [rsp + 32]
+    mov rcx, 32
+    rep movsb
+    lea rsi, [rsp]
+    mov rcx, prf_label_len
+    add rcx, prf_seed_len        ; seed_buf_len
+    rep movsb
+
+    ; Compute iter1 = HMAC(secret, inbuf)
+    lea rdi, [rel prf_secret]
+    mov rsi, prf_secret_len
+    lea rdx, [rsp + 64]
+    mov rcx, 32
+    add rcx, prf_label_len
+    add rcx, prf_seed_len        ; inbuf_len = 32 + seed_buf_len
+    lea r8, [rsp + 96]           ; iter1 at rsp+96
+    call hmac_sha256
+
+    ; Compare iter1 with expected first 32 bytes
+    lea rsi, [rsp + 96]
+    lea rdi, [rel prf_expected_32]
+    mov ecx, 32
+    cld
+    repe cmpsb
+    jne .iter1_fail
+    add rsp, 128
+    jmp .iter1_ok
+.iter1_fail:
+    add rsp, 128
+    jmp .fail
+.iter1_ok:
+
+    ; --- PRF 32-byte test via tls_prf ---
+    lea rdi, [rel prf_secret]
+    mov rsi, prf_secret_len
+    lea rdx, [rel prf_label]
+    mov rcx, prf_label_len
+    lea r8, [rel prf_seed]
+    mov r9, prf_seed_len
+    lea rax, [recv_buf]
+    push 32
+    push rax
+    call tls_prf
+    add rsp, 16
+
+    lea rsi, [recv_buf]
+    lea rdi, [rel prf_expected_32]
+    mov ecx, 32
+    cld
+    repe cmpsb
+    jnz .fail
+
+    ; --- PRF 33-byte test via tls_prf ---
+    lea rdi, [rel prf_secret]
+    mov rsi, prf_secret_len
+    lea rdx, [rel prf_label]
+    mov rcx, prf_label_len
+    lea r8, [rel prf_seed]
+    mov r9, prf_seed_len
+    lea rax, [recv_buf]
+    push 33
+    push rax
+    call tls_prf
+    add rsp, 16
+
+    ; Check first 32 bytes
+    lea rsi, [recv_buf]
+    lea rdi, [rel prf_expected_32]
+    mov ecx, 32
+    cld
+    repe cmpsb
+    jnz .fail
+
+    ; --- PRF 48-byte test via tls_prf ---
+    lea rdi, [rel prf_secret]
+    mov rsi, prf_secret_len
+    lea rdx, [rel prf_label]
+    mov rcx, prf_label_len
+    lea r8, [rel prf_seed]
+    mov r9, prf_seed_len
+    lea rax, [recv_buf]
+    push 48
+    push rax
+    call tls_prf
+    add rsp, 16
+
+    lea rsi, [recv_buf]
+    lea rdi, [rel prf_expected_48]
+    mov ecx, 48
     cld
     repe cmpsb
     jnz .fail

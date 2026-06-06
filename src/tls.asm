@@ -48,16 +48,22 @@ endstruc
 tls_ctx_size equ 118
 
 extern sys_send, sys_recv
+extern hmac_sha256
 
 section .bss
 header_buf:  resb TLS_HEADER_SIZE
 hs_buf:  resb 4096
+prf_seed_buf: resb 512
+prf_abuf:     resb 32
+prf_inbuf:    resb 544
+prf_outbuf:   resb 32
 
 section .text
 global tls_init
 global tls_send
 global tls_recv
 global tls_client_start
+global tls_prf
 
 ; void tls_init(struct tls_ctx *ctx)
 ; rdi = ctx pointer
@@ -568,4 +574,127 @@ _parse_server_hello:
     pop r10
     pop r9
     pop r8
+    ret
+
+; TLS 1.2 PRF (RFC 5246 §5)
+; P_hash(secret, seed) = HMAC_hash(secret, A(1) + seed) ||
+;                        HMAC_hash(secret, A(2) + seed) || ...
+; A(0) = seed, A(i) = HMAC_hash(secret, A(i-1))
+; PRF(secret, label, seed) = P_hash(secret, label + seed)
+;
+; void tls_prf(const void *secret, uint64_t secret_len,
+;              const void *label, uint64_t label_len,
+;              const void *seed, uint64_t seed_len,
+;              void *output, uint64_t output_len)
+; rdi=secret, rsi=secret_len, rdx=label, rcx=label_len
+; r8=seed, r9=seed_len
+; [rsp]=ret addr, [rsp+8]=output, [rsp+16]=output_len (at entry)
+tls_prf:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    ; [rsp+48] = ret addr
+    ; [rsp+56] = output
+    ; [rsp+64] = output_len
+
+    mov r12, rdi              ; secret
+    mov r13, rsi              ; secret_len
+    mov r14, rdx              ; label
+    mov r15, rcx              ; label_len
+                              ; r8 = seed,  r9 = seed_len
+
+    ; Build seed_buf = label + seed
+    lea rbx, [rel prf_seed_buf]
+
+    mov rdi, rbx
+    mov rsi, r14
+    mov rcx, r15
+    cld
+    rep movsb
+
+    mov rsi, r8
+    mov rcx, r9
+    rep movsb
+
+    ; seed_buf_len = label_len + seed_len
+    mov rbp, r15
+    add rbp, r9               ; rbp = seed_buf_len
+
+    ; Compute A(1) = HMAC-SHA256(secret, seed_buf)
+    mov rdi, r12
+    mov rsi, r13
+    lea rdx, [rel prf_seed_buf]
+    mov rcx, rbp
+    lea r8, [rel prf_abuf]
+    call hmac_sha256
+
+    ; Main P_SHA256 loop
+    mov r14, [rsp + 56]       ; output pointer
+    mov r15, [rsp + 64]       ; output_len remaining
+
+.prf_loop:
+    test r15, r15
+    jz .prf_done
+
+    ; Build inbuf = A + seed_buf
+    lea rdi, [rel prf_inbuf]
+    lea rsi, [rel prf_abuf]
+    mov rcx, 32
+    rep movsb
+
+    lea rsi, [rel prf_seed_buf]
+    mov rcx, rbp
+    rep movsb
+
+    ; HMAC-SHA256(secret, inbuf) -> outbuf
+    mov rdi, r12
+    mov rsi, r13
+    lea rdx, [rel prf_inbuf]
+    lea rcx, [rbp + 32]       ; inbuf_len = 32 + seed_buf_len
+    lea r8, [rel prf_outbuf]
+    call hmac_sha256
+
+    ; Copy min(32, remaining) bytes to output
+    cmp r15, 32
+    jb .prf_partial
+
+    lea rsi, [rel prf_outbuf]
+    mov rdi, r14
+    mov rcx, 32
+    rep movsb
+    mov r14, rdi
+    sub r15, 32
+    jmp .prf_next
+
+.prf_partial:
+    lea rsi, [rel prf_outbuf]
+    mov rdi, r14
+    mov rcx, r15
+    rep movsb
+    xor r15, r15
+
+.prf_next:
+    test r15, r15
+    jz .prf_done
+
+    ; A(i+1) = HMAC-SHA256(secret, A(i))
+    mov rdi, r12
+    mov rsi, r13
+    lea rdx, [rel prf_abuf]
+    mov rcx, 32
+    lea r8, [rel prf_abuf]    ; overwrite A buffer
+    call hmac_sha256
+
+    jmp .prf_loop
+
+.prf_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
     ret
