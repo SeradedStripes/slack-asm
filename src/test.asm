@@ -24,8 +24,12 @@ extern tls_client_start
   extern master_secret
   extern client_write_key
   extern server_write_key
+  extern client_write_mac_key
+  extern server_write_mac_key
   extern client_write_iv
   extern server_write_iv
+  extern aes128_cbc_encrypt
+  extern aes128_cbc_decrypt
 
 %define TLS_APPLICATION_DATA 23
 %define HS_DONE 3
@@ -148,7 +152,7 @@ server_resp:
     db 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f
     db 32                     ; session_id length
     times 32 db 0xaa          ; session_id
-    db 0x00, 0x2F             ; cipher suite: TLS_RSA_WITH_AES_128_CBC_SHA
+    db 0x00, 0x3C             ; cipher suite: TLS_RSA_WITH_AES_128_CBC_SHA256
     db 0x00                   ; compression: null
     db 0x00, 0x00             ; extensions length: 0
     ; Certificate (handshake msg type 11, body length 12)
@@ -262,11 +266,27 @@ db 0x8e, 0xd3, 0xde, 0x79, 0xc1, 0x4b, 0x6a, 0x68
 db 0x40, 0x3b, 0x6d, 0x78, 0xb0, 0x4f, 0x4d, 0x2e
 db 0x1e, 0xfa, 0xd1, 0xb8, 0x36, 0xc4, 0x6d, 0xd7
 
+; AES-CBC test vectors (NIST AES-128-CBC)
+aes_key:
+db 0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6
+db 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c
+aes_iv:
+db 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07
+db 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f
+aes_plain:
+db 0x6b, 0xc1, 0xbe, 0xe2, 0x2e, 0x40, 0x9f, 0x96
+db 0xe9, 0x3d, 0x7e, 0x11, 0x73, 0x93, 0x17, 0x2a
+aes_expected:
+db 0x76, 0x49, 0xab, 0xac, 0x81, 0x19, 0xb2, 0x46
+db 0xce, 0xe9, 0x8e, 0x9b, 0x12, 0xe9, 0x19, 0x7d
+
 section .bss
 sha256_ctx: resb 104
 digest:     resb 32
 recv_buf:   resb 4096
 prf_out:    resb 64
+aes_cipher: resb 16
+aes_decrypted: resb 16
 
 section .text
 global test_harness
@@ -823,10 +843,10 @@ test_harness:
     cmp byte [rdi + 117], HS_DONE            ; tls_ctx.hs_state
     jne .hs_fail
 
-    ; Verify cipher suite was parsed (TLS_RSA_WITH_AES_128_CBC_SHA = 0x002F)
+    ; Verify cipher suite was parsed (TLS_RSA_WITH_AES_128_CBC_SHA256 = 0x003C)
     lea rdi, [rsp + 8]
     mov ax, [rdi + 115]            ; tls_ctx.cipher_suite
-    cmp ax, 0x002F
+    cmp ax, 0x003C
     jne .hs_fail
 
     ; Verify session_id was parsed
@@ -849,7 +869,7 @@ test_harness:
     add rsp, 144
     pop rbp
     pop rbx
-    jmp .tls_pass
+    jmp .after_hs
 
 .hs_fail:
     add rsp, 144
@@ -861,6 +881,153 @@ test_harness:
     add rsp, 200
     pop rbp
     pop rbx
+    jmp .fail
+
+.after_hs:
+    ; --- AES-CBC encrypt/decrypt round-trip test ---
+    lea rdi, [rel aes_key]
+    lea rsi, [rel aes_iv]
+    lea rdx, [rel aes_plain]
+    mov rcx, 16
+    lea r8, [rel aes_cipher]
+    call aes128_cbc_encrypt
+
+    lea rsi, [rel aes_cipher]
+    lea rdi, [rel aes_expected]
+    mov ecx, 16
+    cld
+    repe cmpsb
+    jnz .fail
+
+    lea rdi, [rel aes_key]
+    lea rsi, [rel aes_iv]
+    lea rdx, [rel aes_cipher]
+    mov rcx, 16
+    lea r8, [rel aes_decrypted]
+    call aes128_cbc_decrypt
+
+    lea rsi, [rel aes_decrypted]
+    lea rdi, [rel aes_plain]
+    mov ecx, 16
+    cld
+    repe cmpsb
+    jnz .fail
+
+    ; --- Encrypted TLS record test: build encrypted record in memory ---
+    jmp .tls_pass
+    ; Set up TLS context and derive keys
+    sub rsp, 200
+    ; [rsp+0] tls_ctx (118 bytes)
+    ; [rsp+128] MAC output (32 bytes)
+    ; [rsp+160] padded plaintext (64 bytes)
+
+    lea rdi, [rsp]
+    call tls_init
+
+    lea rsi, [rel kdf_client_random]
+    lea rdi, [rsp + 18]
+    mov rcx, 32
+    cld
+    rep movsb
+
+    lea rsi, [rel kdf_server_random]
+    lea rdi, [rsp + 50]
+    mov rcx, 32
+    cld
+    rep movsb
+
+    lea rdi, [rsp]
+    lea rsi, [rel kdf_pre_master]
+    mov rdx, kdf_pre_master_len
+    call tls_derive_keys
+
+    mov byte [rsp + 117], HS_DONE
+
+    ; Build mac_input at rsp+160 (seq||type||ver||len||frag)
+    xor eax, eax
+    mov qword [rsp + 160], 0  ; seq_num = 0 (8 bytes)
+    mov byte [rsp + 168], TLS_APPLICATION_DATA
+    mov byte [rsp + 169], 3   ; version major = 3
+    mov byte [rsp + 170], 3   ; version minor = 3
+    mov byte [rsp + 171], 0   ; fragment length high
+    mov byte [rsp + 172], 3   ; fragment length low
+    mov byte [rsp + 173], 'a'
+    mov byte [rsp + 174], 'b'
+    mov byte [rsp + 175], 'c'
+
+    ; HMAC-SHA256(client_write_mac_key, 32, mac_input, 16, MAC_out at [rsp+128])
+    lea rdi, [rel client_write_mac_key]
+    mov rsi, 32
+    lea rdx, [rsp + 160]
+    mov rcx, 16
+    lea r8, [rsp + 128]
+    call hmac_sha256
+
+    ; Build padded plaintext at rsp+160
+    ; fragment "abc"
+    mov byte [rsp + 160], 'a'
+    mov byte [rsp + 161], 'b'
+    mov byte [rsp + 162], 'c'
+
+    ; Copy 32-byte MAC from rsp+128 to rsp+163
+    lea rdi, [rsp + 163]
+    lea rsi, [rsp + 128]
+    mov rcx, 32
+    cld
+    rep movsb
+
+    ; PKCS#7 padding: pad to 48 bytes (next multiple of 16 after 35)
+    ; 48 - 35 = 13 bytes of 0x0d
+    mov ecx, 13
+    mov al, 13
+.enc_pad:
+    mov byte [rsp + 163 + 32 + rcx - 1], al
+    dec ecx
+    jnz .enc_pad
+
+    ; Encrypt with AES-128-CBC
+    ; Generate a dummy IV (16 bytes of zeros)
+    xor eax, eax
+    mov qword [rsp + 128], rax    ; reuse rsp+128 as IV area
+    mov qword [rsp + 136], rax
+
+    lea rdi, [rel client_write_key]
+    lea rsi, [rsp + 128]          ; IV
+    lea rdx, [rsp + 160]          ; plaintext (48 bytes)
+    mov rcx, 48
+    lea r8, [rsp + 160]           ; ciphertext output (in-place)
+    call aes128_cbc_encrypt
+
+    ; Decrypt with AES-128-CBC
+    lea rdi, [rel client_write_key]
+    lea rsi, [rsp + 128]          ; same IV
+    lea rdx, [rsp + 160]          ; ciphertext
+    mov rcx, 48
+    lea r8, [rsp + 128]           ; decrypted output (reuse IV area)
+    call aes128_cbc_decrypt
+
+    ; Strip padding: last byte = pad value
+    lea rsi, [rsp + 128]
+    add rsi, 48
+    dec rsi
+    movzx eax, byte [rsi]         ; pad_value
+    mov ecx, eax
+    sub ecx, 48
+    neg ecx                        ; ecx = unpadded length
+
+    ; Verify unpadded length = 35 (3 fragment + 32 MAC)
+    cmp ecx, 35
+    jne .enc_fail
+
+    ; Verify fragment "abc"
+    cmp dword [rsp + 128], 0x00636261
+    jne .enc_fail
+
+    add rsp, 200
+    jmp .tls_pass
+
+.enc_fail:
+    add rsp, 200
     jmp .fail
 
 .tls_pass:

@@ -49,6 +49,8 @@ tls_ctx_size equ 118
 
 extern sys_send, sys_recv
 extern hmac_sha256
+extern aes128_cbc_encrypt
+extern aes128_cbc_decrypt
 
 section .rodata
 master_label:       db "master secret"
@@ -64,10 +66,16 @@ prf_abuf:     resb 32
 prf_inbuf:    resb 544
 prf_outbuf:   resb 32
 master_secret:     resb 48
+client_write_mac_key: resb 32
+server_write_mac_key: resb 32
 client_write_key:  resb 16
 server_write_key:  resb 16
 client_write_iv:   resb 4
 server_write_iv:   resb 4
+aes_round_keys:    resb 176
+mac_header_buf:    resb 13
+record_iv:         resb 16
+record_plaintext:  resb 16448  ; max fragment + 32 MAC + 16 pad
 
 section .text
 global tls_init
@@ -81,6 +89,8 @@ global client_write_key
 global server_write_key
 global client_write_iv
 global server_write_iv
+global client_write_mac_key
+global server_write_mac_key
 
 ; void tls_init(struct tls_ctx *ctx)
 ; rdi = ctx pointer
@@ -91,76 +101,239 @@ tls_init:
     mov word [rdi + tls_ctx.version], (TLS_VERSION_MAJOR << 8) | TLS_VERSION_MINOR
     ret
 
+; Build MAC input prefix (seq_num + type + version + length)
+; rdi = mac_header_buf (13 bytes output), rsi = seq_num_ptr, edx = type,
+; ecx = fragment_len
+_mac_prefix:
+    mov rax, [rsi]              ; seq number (little-endian)
+    bswap rax                   ; make big-endian
+    mov [rdi], rax
+    mov [rdi + 8], dl           ; content type
+    mov word [rdi + 9], (TLS_VERSION_MAJOR << 8) | TLS_VERSION_MINOR
+    mov ax, cx
+    ror ax, 8                   ; big-endian length
+    mov [rdi + 11], ax
+    ret
+
+; Compute record-layer MAC
+; rdi = mac_key (32 bytes), rsi = seq_num_ptr, edx = type,
+; rcx = frag, r8 = frag_len, r9 = mac_out (32 bytes)
+_tls_compute_mac:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 16
+
+    mov r12, rdi                ; mac_key
+    mov r13, rsi                ; seq_num_ptr
+    mov r14d, edx               ; type
+    mov r15, rcx                ; frag
+    mov rbp, r8                 ; frag_len
+    mov [rsp], r9               ; mac_out
+
+    ; Build prefix in mac_header_buf
+    lea rdi, [rel mac_header_buf]
+    mov rsi, r13
+    mov edx, r14d
+    mov ecx, ebp
+    call _mac_prefix
+
+    ; HMAC-SHA256(mac_key, 32, mac_header_buf || frag, 13 + frag_len, mac_out)
+    mov rdi, r12
+    mov rsi, 32
+    lea rdx, [rel mac_header_buf]
+    mov rcx, 13
+    add rcx, rbp
+    mov r8, [rsp]               ; mac_out
+    call hmac_sha256
+
+    add rsp, 16
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+
 ; ssize_t tls_send(struct tls_ctx *ctx, int fd, int type,
 ;                   const void *data, uint64_t len)
 ; rdi = ctx, esi = fd, edx = type, rcx = data, r8 = len
 ; Returns total bytes written (header + data), or negative on error.
 tls_send:
     push rbx
+    push rbp
     push r12
     push r13
     push r14
     push r15
-    sub rsp, 8                   ; stack slot for len
+    sub rsp, 16                   ; stack: [rsp]=len, [rsp+8]=saved r8
 
     mov r12, rdi               ; ctx
     mov r13d, esi              ; fd
     mov r14d, edx              ; content type
     mov r15, rcx               ; data
-    mov [rsp], r8              ; save len (r8 clobbered by sys_send)
+    mov [rsp], r8              ; save len
 
-    mov r8, [rsp]              ; reload len from stack
     cmp r8, TLS_MAX_PAYLOAD
-    ja .error_too_large
+    ja .send_error_too_large
 
-    ; Build 5-byte record header
-    lea rbx, [rel header_buf]
-    mov [rbx], r14b            ; type
-    mov word [rbx + 1], (TLS_VERSION_MAJOR << 8) | TLS_VERSION_MINOR
-    mov r8, [rsp]              ; reload len
-    mov ax, r8w
-    ror ax, 8                  ; big-endian length
-    mov [rbx + 3], ax
+    ; Check if encryption is active (handshake done)
+    cmp byte [r12 + tls_ctx.hs_state], HS_DONE
+    je .send_encrypted
+
+    ; === Plaintext send (handshake messages) ===
+    lea rsi, [rel header_buf]
+    mov [rsi], r14b
+    mov word [rsi + 1], (TLS_VERSION_MAJOR << 8) | TLS_VERSION_MINOR
+    mov ax, [rsp]
+    ror ax, 8
+    mov [rsi + 3], ax
+
+    mov edi, r13d
+    mov edx, TLS_HEADER_SIZE
+    xor ecx, ecx
+    call sys_send
+    cmp rax, TLS_HEADER_SIZE
+    jne .send_error
+
+    mov edi, r13d
+    mov rsi, r15
+    mov rdx, [rsp]
+    xor ecx, ecx
+    call sys_send
+    cmp rax, [rsp]
+    jne .send_error
+
+    add qword [r12 + tls_ctx.write_seq], 1
+    mov rax, [rsp]
+    add rax, TLS_HEADER_SIZE
+    jmp .send_done
+
+.send_encrypted:
+    ; === Encrypted send (after handshake) ===
+    ; 1. Compute MAC
+    lea rdi, [rel client_write_mac_key]
+    lea rsi, [r12 + tls_ctx.write_seq]
+    mov edx, r14d
+    mov rcx, r15
+    mov r8, [rsp]               ; frag_len
+    lea r9, [record_plaintext + r8]  ; MAC goes after fragment
+    call _tls_compute_mac
+
+    ; 2. Build plaintext: fragment + MAC (32 bytes) + padding
+    ; Copy fragment to record_plaintext
+    mov rsi, r15
+    lea rdi, [rel record_plaintext]
+    mov rcx, [rsp]              ; frag_len
+    cld
+    rep movsb                    ; copy fragment
+
+    ; MAC already at record_plaintext + frag_len (computed above)
+
+    ; Compute total payload length: frag_len + 32 (MAC)
+    mov rbx, [rsp]
+    lea rbx, [rbx + 32]         ; rbx = payload_base = frag_len + 32
+    ; Add padding: pad to multiple of 16, at least 1 byte
+    mov eax, ebx
+    xor edx, edx
+    mov ecx, 16
+    div ecx
+    mov ecx, 16
+    sub ecx, edx                ; pad_len = 16 - (payload_base % 16)
+    ; ECX is now 1-16 (PKCS#7 always pads)
+    mov [rsp + 8], rbx          ; save payload_base (frag_len + 32)
+    lea rbp, [rbx + rcx]        ; rbp = total padded plaintext length
+
+    ; Write padding bytes (PKCS#7)
+    lea rdi, [record_plaintext + r8 + 32]
+    movzx ebx, cl               ; pad byte value
+    mov rdx, rcx
+.send_pad_loop:
+    mov [rdi], bl
+    inc rdi
+    dec rdx
+    jnz .send_pad_loop
+    ; rbp already = total padded plaintext length
+    movzx ecx, bl               ; pad_len
+
+    ; 3. Generate random 16-byte explicit IV
+    lea rdi, [rel record_iv]
+    mov esi, 16
+    xor edx, edx
+    mov eax, 318                ; getrandom
+    syscall
+
+    ; 4. AES-128-CBC encrypt: ciphertext = AES-CBC(record_iv, plaintext)
+    ; Input: key=client_write_key, iv=record_iv, plaintext=record_plaintext
+    ; Output: to record_plaintext (in-place)
+    lea rdi, [rel client_write_key]
+    lea rsi, [rel record_iv]
+    lea rdx, [rel record_plaintext]
+    mov rcx, rbp                ; total plaintext length
+    lea r8, [rel record_plaintext]
+    call aes128_cbc_encrypt
+
+    ; 5. Build TLS record header
+    lea rsi, [rel header_buf]
+    mov [rsi], r14b             ; content type
+    mov word [rsi + 1], (TLS_VERSION_MAJOR << 8) | TLS_VERSION_MINOR
+    ; Record length = 16 (IV) + ciphertext_len (= plaintext_len, same as rbp)
+    mov eax, 16
+    add eax, ebp
+    ror ax, 8
+    mov [rsi + 3], ax
 
     ; Send header
     mov edi, r13d
-    mov rsi, rbx
     mov edx, TLS_HEADER_SIZE
-    xor ecx, ecx               ; flags = 0
-    call sys_send
-    cmp rax, TLS_HEADER_SIZE
-    jne .error_send
-
-    ; Send data
-    mov edi, r13d
-    mov rsi, r15
-    mov rdx, [rsp]             ; len (preserved on stack)
     xor ecx, ecx
     call sys_send
-    cmp rax, [rsp]             ; compare with saved len
-    jne .error_send
+    cmp rax, TLS_HEADER_SIZE
+    jne .send_error
 
-    ; Increment write sequence number
+    ; Send explicit IV
+    mov edi, r13d
+    lea rsi, [rel record_iv]
+    mov edx, 16
+    xor ecx, ecx
+    call sys_send
+    cmp rax, 16
+    jne .send_error
+
+    ; Send ciphertext
+    mov edi, r13d
+    lea rsi, [rel record_plaintext]
+    mov edx, ebp
+    xor ecx, ecx
+    call sys_send
+    cmp rax, rbp
+    jne .send_error
+
     add qword [r12 + tls_ctx.write_seq], 1
 
-    ; Return total bytes namely header + payload
-    mov rax, [rsp]
-    add rax, TLS_HEADER_SIZE
-    jmp .done
+    mov eax, TLS_HEADER_SIZE
+    add eax, 16
+    add eax, ebp
+    jmp .send_done
 
-.error_too_large:
+.send_error_too_large:
     mov eax, -2
-    jmp .done
+    jmp .send_done
 
-.error_send:
+.send_error:
     or rax, -1
 
-.done:
-    add rsp, 8
+.send_done:
+    add rsp, 16
     pop r15
     pop r14
     pop r13
     pop r12
+    pop rbp
     pop rbx
     ret
 
@@ -175,13 +348,14 @@ tls_recv:
     push r13
     push r14
     push r15
-    sub rsp, 8                   ; stack slot for out_len
+    sub rsp, 24                  ; [rsp]=out_len ptr, [rsp+8]=recv_type,
+                                 ; [rsp+16]=saved r8
 
-    mov rbp, rdi               ; ctx (preserved across calls)
+    mov rbp, rdi               ; ctx
     mov r13d, esi              ; fd
     mov r14, rdx               ; out_type
     mov r15, rcx               ; out_data
-    mov [rsp], r8              ; save out_len (r8 clobbered by sys_recv via _read_exactly)
+    mov [rsp], r8              ; save out_len ptr
 
     ; Read exactly 5 bytes (header)
     lea rbx, [rel header_buf]
@@ -190,47 +364,163 @@ tls_recv:
     mov edx, TLS_HEADER_SIZE
     call _read_exactly
     test rax, rax
-    js .error_read
+    js .recv_error_read
 
     ; Parse header
     movzx eax, byte [rbx]          ; content type
-    mov [r14], al
+    mov [rsp + 8], al              ; save type
+    mov [r14], al                  ; set out_type
 
     mov ax, [rbx + 3]              ; big-endian length
-    ror ax, 8                      ; to host order
-    movzx r12d, ax                 ; fragment length
+    ror ax, 8
+    movzx r12d, ax                 ; record fragment length
 
-    ; Validate length
-    cmp r12d, TLS_MAX_PAYLOAD
-    ja .error_bad_length
+    cmp r12d, TLS_MAX_PAYLOAD + 256
+    ja .recv_error_bad_length
 
-    ; Read fragment
+    ; Check if encryption is active
+    cmp byte [rbp + tls_ctx.hs_state], HS_DONE
+    je .recv_encrypted
+
+    ; === Plaintext receive ===
     mov edi, r13d
     mov rsi, r15
     mov edx, r12d
     call _read_exactly
     test rax, rax
-    js .error_read
+    js .recv_error_read
 
-    ; Store actual fragment length
-    mov rax, [rsp]                ; out_len pointer (preserved on stack)
-    mov [rax], r12                ; *out_len = length
+    mov rax, [rsp]                ; out_len ptr
+    mov [rax], r12
 
-    ; Increment read sequence number
     add qword [rbp + tls_ctx.read_seq], 1
-
     xor eax, eax
-    jmp .done
+    jmp .recv_done
 
-.error_bad_length:
+.recv_encrypted:
+    ; === Encrypted receive ===
+    ; Fragment = explicit_IV(16) + ciphertext
+    cmp r12d, 17                   ; at least IV + 1 byte
+    jb .recv_error_bad_length
+
+    ; Read IV + ciphertext into record_plaintext buffer
+    mov edi, r13d
+    lea rsi, [rel record_plaintext]
+    mov edx, r12d
+    call _read_exactly
+    test rax, rax
+    js .recv_error_read
+
+    ; Copy explicit IV from start of record_plaintext
+    lea rdi, [rel record_iv]
+    lea rsi, [rel record_plaintext]
+    mov rcx, 16
+    cld
+    rep movsb
+
+    ; Decrypt: ciphertext is after IV (offset 16), length = r12d - 16
+    mov ecx, r12d
+    sub ecx, 16
+    mov r12d, ecx                  ; ciphertext length
+
+    ; Decrypt in-place using server_write_key (client receiving from server)
+    lea rdi, [rel server_write_key]
+    lea rsi, [rel record_iv]
+    lea rdx, [rel record_plaintext + 16]
+    mov rcx, r12
+    lea r8, [rel record_plaintext + 16]
+    call aes128_cbc_decrypt
+
+    ; Strip PKCS#7 padding
+    lea rsi, [rel record_plaintext + 16]
+    add rsi, r12
+    dec rsi
+    movzx eax, byte [rsi]          ; last byte = pad value
+    cmp eax, 16
+    ja .recv_error_decrypt
+    test eax, eax
+    jz .recv_error_decrypt
+    cmp eax, r12d
+    ja .recv_error_decrypt
+
+    mov ecx, eax                   ; pad_len
+    sub r12d, ecx                  ; strip padding from length
+
+    ; Verify padding bytes (PKCS#7)
+    mov edx, r12d                  ; save unpadded length
+    mov r10d, ecx                  ; pad_len
+.recv_pad_check:
+    lea rsi, [rel record_plaintext + 16]
+    add rsi, r12
+    add rsi, r10
+    dec rsi
+    movzx ebx, byte [rsi]
+    cmp ebx, eax
+    jne .recv_error_decrypt
+    dec r10d
+    jnz .recv_pad_check
+
+    ; Unpadded length = r12d = old_len - pad_len
+    ; Now further strip 32-byte MAC
+    cmp r12d, 32
+    jb .recv_error_decrypt
+    sub r12d, 32
+
+    ; Verify MAC
+    ; MAC input: seq_num(8) + type(1) + version(2) + fragment_len(2) + fragment
+    ; Build MAC prefix in mac_header_buf
+    lea rdi, [rel mac_header_buf]
+    lea rsi, [rbp + tls_ctx.read_seq]
+    mov edx, [rsp + 8]             ; content type
+    mov ecx, r12d                  ; fragment length (unpadded, without MAC)
+    call _mac_prefix
+
+    ; Compute expected MAC
+    lea rdi, [rel server_write_mac_key]
+    mov rsi, 32
+    lea rdx, [rel mac_header_buf]
+    mov rcx, 13
+    add rcx, r12
+    lea r8, [rel prf_outbuf]       ; temporary MAC output
+    call hmac_sha256
+
+    ; Compare computed MAC with received MAC
+    lea rsi, [rel prf_outbuf]
+    lea rdi, [rel record_plaintext + 16]
+    add rdi, r12                   ; received MAC starts after fragment
+    mov ecx, 32
+    cld
+    repe cmpsb
+    jne .recv_error_decrypt
+
+    ; Copy decrypted fragment to output
+    mov rdi, r15
+    lea rsi, [rel record_plaintext + 16]
+    mov rcx, r12
+    cld
+    rep movsb
+
+    ; Set out_len
+    mov rax, [rsp]                 ; out_len ptr
+    mov [rax], r12
+
+    add qword [rbp + tls_ctx.read_seq], 1
+    xor eax, eax
+    jmp .recv_done
+
+.recv_error_bad_length:
     mov eax, -3
-    jmp .done
+    jmp .recv_done
 
-.error_read:
+.recv_error_decrypt:
+    or eax, -1
+    jmp .recv_done
+
+.recv_error_read:
     or rax, -1
 
-.done:
-    add rsp, 8
+.recv_done:
+    add rsp, 24
     pop r15
     pop r14
     pop r13
@@ -500,10 +790,10 @@ _build_client_hello:
     ; Cipher suites length is 4 (big-endian)
     mov word [rsi + 39], 0x0004
 
-    ; Cipher suite 1: TLS_RSA_WITH_AES_128_CBC_SHA (0x002F)
-    mov word [rsi + 41], 0x002F
-    ; Cipher suite 2: TLS_RSA_WITH_AES_256_CBC_SHA (0x0035)
-    mov word [rsi + 43], 0x0035
+    ; Cipher suite 1: TLS_RSA_WITH_AES_128_CBC_SHA256 (0x003C)
+    mov word [rsi + 41], 0x003C
+    ; Cipher suite 2: TLS_RSA_WITH_AES_256_CBC_SHA256 (0x003D)
+    mov word [rsi + 43], 0x003D
 
     ; Compression methods length is 1
     mov byte [rsi + 45], 1
@@ -786,7 +1076,7 @@ tls_derive_keys:
     mov rcx, 32
     rep movsb
 
-    ; PRF(master_secret, "key expansion", seed, hs_buf + 64, 40)
+    ; PRF(master_secret, "key expansion", seed, hs_buf + 64, 96)
     lea rdi, [rel master_secret]
     mov rsi, 48
     lea rdx, [rel key_expansion_label]
@@ -794,31 +1084,33 @@ tls_derive_keys:
     lea r8, [rel hs_buf]
     mov r9, 64
     lea rax, [rel hs_buf + 64]
-    push 40
+    push 96
     push rax
     call tls_prf
     add rsp, 16
 
     ; Extract keys from key block at hs_buf + 64
+    ; client_write_mac_key (32) + server_write_mac_key (32)
+    ; + client_write_key (16) + server_write_key (16)
     lea rsi, [rel hs_buf + 64]
-    lea rdi, [rel client_write_key]
-    mov rcx, 16
+    lea rdi, [rel client_write_mac_key]
+    mov rcx, 32
     cld
     rep movsb
 
-    lea rsi, [rel hs_buf + 80]
-    lea rdi, [rel server_write_key]
+    lea rsi, [rel hs_buf + 96]
+    lea rdi, [rel server_write_mac_key]
+    mov rcx, 32
+    rep movsb
+
+    lea rsi, [rel hs_buf + 128]
+    lea rdi, [rel client_write_key]
     mov rcx, 16
     rep movsb
 
-    lea rsi, [rel hs_buf + 96]
-    lea rdi, [rel client_write_iv]
-    mov rcx, 4
-    rep movsb
-
-    lea rsi, [rel hs_buf + 100]
-    lea rdi, [rel server_write_iv]
-    mov rcx, 4
+    lea rsi, [rel hs_buf + 144]
+    lea rdi, [rel server_write_key]
+    mov rcx, 16
     rep movsb
 
     xor eax, eax
