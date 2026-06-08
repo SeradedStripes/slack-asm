@@ -914,9 +914,8 @@ test_harness:
     jnz .fail
 
     ; --- Encrypted TLS record test: build encrypted record in memory ---
-    jmp .tls_pass
     ; Set up TLS context and derive keys
-    sub rsp, 200
+    sub rsp, 224
     ; [rsp+0] tls_ctx (118 bytes)
     ; [rsp+128] MAC output (32 bytes)
     ; [rsp+160] padded plaintext (64 bytes)
@@ -1019,15 +1018,17 @@ test_harness:
     cmp ecx, 35
     jne .enc_fail
 
-    ; Verify fragment "abc"
-    cmp dword [rsp + 128], 0x00636261
+    ; Verify fragment "abc" (first 3 bytes)
+    cmp word [rsp + 128], 0x6261            ; "ab"
+    jne .enc_fail
+    cmp byte [rsp + 130], 0x63              ; "c"
     jne .enc_fail
 
-    add rsp, 200
+    add rsp, 224
     jmp .tls_pass
 
 .enc_fail:
-    add rsp, 200
+    add rsp, 224
     jmp .fail
 
 .tls_pass:

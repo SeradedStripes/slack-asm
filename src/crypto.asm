@@ -1341,14 +1341,6 @@ aes128_cbc_decrypt:
     cmp r12, r15
     jae .cd_done
 
-    ; Copy ciphertext block to prev_block buffer (for next IV)
-    lea rdi, [rsp + 16]
-    mov rsi, r14
-    add rsi, r12
-    mov rcx, 16
-    cld
-    rep movsb                            ; save current ciphertext block
-
     ; Decrypt ciphertext block
     mov rdi, r14
     add rdi, r12                         ; ciphertext block
@@ -1366,6 +1358,15 @@ aes128_cbc_decrypt:
     inc ecx
     cmp ecx, 16
     jb .cd_xor
+
+    ; Copy ciphertext block to prev_block buffer (for next IV)
+    ; Must happen after XOR so [rsp+16] still holds prev block for XOR
+    lea rdi, [rsp + 16]
+    mov rsi, r14
+    add rsi, r12
+    mov rcx, 16
+    cld
+    rep movsb                            ; save current ciphertext block
 
     ; Copy decrypted block to output
     mov rdi, rbp
