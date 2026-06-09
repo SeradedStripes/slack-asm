@@ -51,6 +51,8 @@ extern sys_send, sys_recv
 extern hmac_sha256
 extern aes128_cbc_encrypt
 extern aes128_cbc_decrypt
+extern x509_parse_cert
+extern x509_check_validity
 
 section .rodata
 master_label:       db "master secret"
@@ -757,7 +759,55 @@ tls_client_start:
     cmp al, HS_CERTIFICATE
     jne .tcs_error
 
-    ; Skip Certificate body for now (Might do it later)
+    ; Parse first certificate from the Certificate message
+    ; r14+4 = body start, ebx = body length
+    lea r9, [r14 + 4]
+    cmp ebx, 6
+    jb .tcs_error
+
+    ; Read certificate_list_length (3 bytes, big-endian)
+    movzx eax, byte [r9]
+    shl eax, 16
+    movzx ecx, byte [r9 + 1]
+    shl ecx, 8
+    or eax, ecx
+    movzx ecx, byte [r9 + 2]
+    or eax, ecx
+    cmp eax, 3
+    jb .tcs_error
+
+    ; Read first cert length (3 bytes, big-endian)
+    movzx eax, byte [r9 + 3]
+    shl eax, 16
+    movzx ecx, byte [r9 + 4]
+    shl ecx, 8
+    or eax, ecx
+    movzx ecx, byte [r9 + 5]
+    or eax, ecx
+    test eax, eax
+    jz .tcs_error
+
+    ; Parse DER certificate
+    lea rdi, [r9 + 6]
+    mov esi, eax
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbx
+    push rsi
+    push rdi
+    call x509_parse_cert
+    pop rdi
+    pop rsi
+    pop rbx
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    test eax, eax
+    jnz .tcs_error
+
     mov byte [r12 + tls_ctx.hs_state], HS_WAIT_SERVER_HELLO_DONE
     jmp .tcs_advance
 
@@ -804,6 +854,11 @@ tls_client_start:
     lea rsi, [rsp + 16]
     mov edx, 48
     call tls_derive_keys
+
+    ; Validate certificate validity period
+    call x509_check_validity
+    test eax, eax
+    jnz .tcs_error
 
     xor eax, eax
     jmp .tcs_return

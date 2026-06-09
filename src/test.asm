@@ -30,6 +30,12 @@ extern tls_client_start
   extern server_write_iv
   extern aes128_cbc_encrypt
   extern aes128_cbc_decrypt
+  extern x509_parse_cert
+  extern x509_check_validity
+  extern cert_not_before
+  extern cert_not_after
+  extern server_pubkey_n_len
+  extern server_pubkey_e_len
 
 %define TLS_APPLICATION_DATA 23
 %define HS_DONE 3
@@ -137,11 +143,11 @@ db 0xbf, 0xdc, 0x63, 0x64, 0x4f, 0x07, 0x13, 0x93
 db 0x8a, 0x7f, 0x51, 0x53, 0x5c, 0x3a, 0x35, 0xe2
 
 ; TLS server response for handshake test
-; TLS Record: Handshake(22), version 0x0303, length 96
-; Contains ServerHello + Certificate + ServerHelloDone
+; TLS Record: Handshake(22), version 0x0303, length 1017
+; Contains ServerHello + Certificate (with real DER cert) + ServerHelloDone
 server_resp:
-    ; TLS Record: Handshake(22), version 0x0303 (TLS 1.2), length 96
-    db 0x16, 0x03, 0x03, 0x00, 0x60
+    ; TLS Record: Handshake(22), version 0x0303 (TLS 1.2), length 1017
+    db 0x16, 0x03, 0x03, 0x03, 0xF9
     ; ServerHello (handshake msg type 2, body length 72)
     db 0x02, 0x00, 0x00, 72
     db 0x03, 0x03             ; version TLS 1.2
@@ -156,15 +162,18 @@ server_resp:
     db 0x00, 0x3C             ; cipher suite: TLS_RSA_WITH_AES_128_CBC_SHA256
     db 0x00                   ; compression: null
     db 0x00, 0x00             ; extensions length: 0
-    ; Certificate (handshake msg type 11, body length 12)
-    db 0x0B, 0x00, 0x00, 12
-    db 0x00, 0x00, 9          ; certificate list length
-    db 0x00, 0x00, 6          ; cert[0] length
-    db "CERT!!"               ; dummy certificate data
+    ; Certificate (handshake msg type 11, body length 933)
+    db 0x0B, 0x00, 0x03, 0xA5
+    db 0x00, 0x03, 0xA2       ; certificate list length = 930
+    db 0x00, 0x03, 0x9F       ; cert[0] length = 927
+test_cert_der:
+    incbin "src/test_cert.der"
+test_cert_der_end:
     ; ServerHelloDone (handshake msg type 14, body length 0)
     db 0x0E, 0x00, 0x00, 0
 server_resp_end:
 server_resp_len equ $ - server_resp
+test_cert_der_len equ test_cert_der_end - test_cert_der
 
 msg_pass:     db "all tests passed", 10
 msg_pass_len: equ $ - msg_pass
@@ -326,6 +335,7 @@ test_harness:
 
 
 
+
     lea rdi, [sha256_ctx]
     call sha256_init
 
@@ -358,6 +368,7 @@ test_harness:
     cld
     repe cmpsb
     jnz .fail
+
 
     lea rdi, [hmac_key1]
     mov rsi, hmac_key1_len
@@ -456,6 +467,7 @@ test_harness:
     cld
     repe cmpsb
     jnz .fail
+
 
     ; --- PRF intermediate value tests ---
     ; Build seed_buf on stack = label + seed
@@ -629,6 +641,7 @@ test_harness:
     cld
     repe cmpsb
     jnz .fail
+
 
     ; --- Key derivation test: direct HMAC of seed_buf ---
     sub rsp, 128
@@ -914,6 +927,7 @@ test_harness:
     jmp .fail
 
 .after_hs:
+
     ; --- AES-CBC encrypt/decrypt round-trip test ---
     lea rdi, [rel aes_key]
     lea rsi, [rel aes_iv]
@@ -1078,6 +1092,34 @@ test_harness:
     jmp .fail
 
 .tls_pass:
+
+    ; --- X.509 Certificate parser test ---
+    lea rdi, [rel test_cert_der]
+    mov esi, test_cert_der_len
+    call x509_parse_cert
+    test eax, eax
+    jnz .fail
+
+    ; Verify dates were parsed
+    cmp dword [rel cert_not_before], 0
+    je .fail
+    cmp dword [rel cert_not_after], 0
+    je .fail
+    mov eax, [rel cert_not_before]
+    cmp eax, [rel cert_not_after]
+    jae .fail
+
+    ; Verify pubkey was extracted
+    cmp word [rel server_pubkey_n_len], 0
+    je .fail
+    cmp word [rel server_pubkey_e_len], 0
+    je .fail
+
+    ; Verify certificate validity
+    call x509_check_validity
+    test eax, eax
+    jnz .fail
+
     mov rax, 1
     mov rdi, 1
     lea rsi, [rel msg_pass]
