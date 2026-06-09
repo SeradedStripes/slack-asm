@@ -348,7 +348,6 @@ memcpy_internal:
 ;            const void *msg, size_t msg_len,
 ;            void *mac)
 ; rdi=key, rsi=key_len, rdx=msg, rcx=msg_len, r8=mac
-; More programming languages should have a commenting style like this
 hmac_sha256:
     push rbx
     push rbp
@@ -364,7 +363,8 @@ hmac_sha256:
     mov r15, rcx
     mov [rsp + 232], r8
 
-    lea rbp, [rsp]           ; rbp = K' buffer of 64 bytes
+    ; rbp = K' buffer of 64 bytes
+    lea rbp, [rsp]
 
     cmp r13, 64
     ja .hash_key
@@ -470,9 +470,9 @@ hmac_sha256:
     pop rbx
     ret
 
-; ============================================================
+; ------------------------------------------------------------
 ; AES-128-CBC (FIPS 197, RFC 5246)
-; ============================================================
+; ------------------------------------------------------------
 
 section .rodata
 
@@ -562,26 +562,22 @@ aes128_key_expand:
     push rbx
     push r12
 
-    ; Copy first 4 words directly from key
     mov rax, [rdi]
     mov [rsi], rax
     mov rax, [rdi + 8]
     mov [rsi + 8], rax
 
-    xor r12d, r12d           ; rcon index
-    mov ecx, 4               ; word index
+    xor r12d, r12d
+    mov ecx, 4
 
 .ke_loop:
-    ; temp = word[i-1]
     mov eax, [rsi + rcx*4 - 4]
 
-    test cl, 3               ; if (i % 4 == 0) ?
+    test cl, 3
     jnz .ke_no_rot
 
-    ; RotWord: rotate left by 1 byte (ror on LE x86 = RotWord in AES)
     ror eax, 8
 
-    ; SubWord: apply S-box to each byte
     movzx ebx, al
     movzx ebx, byte [aes_sbox + rbx]
     movzx edx, ah
@@ -599,13 +595,11 @@ aes128_key_expand:
     mov eax, ebx
     or eax, edx
 
-    ; XOR with Rcon[rcon_index]
     movzx ebx, byte [aes_rcon + r12]
     xor al, bl
     inc r12d
 
 .ke_no_rot:
-    ; word[i] = word[i-4] XOR temp
     mov ebx, [rsi + rcx*4 - 16]
     xor eax, ebx
     mov [rsi + rcx*4], eax
@@ -685,24 +679,6 @@ _shift_rows:
     pop rbx
     ret
 
-; static void _inv_shift_rows(void *state)
-; Row 1: shift right 1 = [1,5,9,13] ← [13,1,5,9]
-; Row 2: shift right 2 = [2,6,10,14] ← [6,10,14,2] (already correct: shift left 2 reversed)
-; Actually: inv shift right 1 = left 3, etc.
-; Row 1: left shift original, so inv = right shift 1: [1,5,9,13] ← [13,1,5,9]
-; Row 2: left shift 2, inv = right shift 2: [2,6,10,14] ← [14,2,6,10]?? 
-; Wait, let me think again.
-; Forward: Row 1: [1,5,9,13] → [5,9,13,1] (left 1)
-; Inverse: Row 1: [5,9,13,1] → [1,5,9,13] (right 1) = [1,5,9,13] ← [13,1,5,9]
-;   So: new[1]=old[13], new[5]=old[1], new[9]=old[5], new[13]=old[9]
-; Forward: Row 2: [2,6,10,14] → [10,14,2,6] (left 2)
-; Inverse: Row 2: [10,14,2,6] → [2,6,10,14] (right 2) = [2,6,10,14] ← [10,14,2,6]
-;   So: new[2]=old[10], new[6]=old[14], new[10]=old[2], new[14]=old[6]
-; But that's the same mapping as forward shift left 2!
-; Actually it's symmetric for shift 2: left2 and right2 are the same.
-; Forward: Row 3: [3,7,11,15] → [15,3,7,11] (left 3)
-; Inverse: Row 3: [15,3,7,11] → [3,7,11,15] (right 3 = left 1)
-;   So: new[3]=old[7], new[7]=old[11], new[11]=old[15], new[15]=old[3]
 _inv_shift_rows:
     push rbx
     ; Row 1 (inv right 1): [1,5,9,13] ← [13,1,5,9]
@@ -757,38 +733,44 @@ _mix_columns:
     push r14
     push r15
 
-    xor r12d, r12d            ; column index
+    ; column index
+    xor r12d, r12d
 .mc_col:
     ; Load column (4 contiguous bytes)
-    movzx r13d, byte [rdi + r12*4]      ; a = s[0, r12]
-    movzx r14d, byte [rdi + r12*4 + 1]  ; b = s[1, r12]
-    movzx r15d, byte [rdi + r12*4 + 2]  ; c = s[2, r12]
-    movzx ebx,  byte [rdi + r12*4 + 3]  ; d = s[3, r12]
+    ; a = s[0, r12]
+    movzx r13d, byte [rdi + r12*4]
+    ; b = s[1, r12]
+    movzx r14d, byte [rdi + r12*4 + 1]
+    ; c = s[2, r12]
+    movzx r15d, byte [rdi + r12*4 + 2]
+    ; d = s[3, r12]
+    movzx ebx,  byte [rdi + r12*4 + 3]
 
     ; Compute tmp = a XOR b XOR c XOR d
     mov eax, r13d
     xor eax, r14d
     xor eax, r15d
-    xor eax, ebx                        ; eax = tmp
+    ; eax = tmp
+    xor eax, ebx
 
     ; Compute xtime(a XOR b)
     mov ecx, r13d
     xor ecx, r14d
     mov al, cl
-    call _xtime                        ; al = xtime(a ^ b)
+    ; al = xtime(a ^ b)
+    call _xtime
     mov ecx, eax
 
     ; XOR with xtime(c XOR d)
     mov eax, r15d
     xor eax, ebx
     call _xtime
-    xor ecx, eax                       ; ecx = xtime(a^b) ^ xtime(c^d)
+    ; ecx = xtime(a^b) ^ xtime(c^d)
+    xor ecx, eax
 
-    ; Now compute each output byte
     ; out_a = xtime(a) ^ xtime(b) ^ b ^ c ^ d
     ;       = xtime(a) ^ xtime(b) ^ tmp ^ b
     ;       = (xtime(a) ^ a) ^ (xtime(b) ^ b) ^ tmp
-    ; We'll do it directly:
     ; out_a = (2*a) ^ (3*b) ^ c ^ d
     ; out_b = a ^ (2*b) ^ (3*c) ^ d
     ; out_c = a ^ b ^ (2*c) ^ (3*d)
@@ -798,53 +780,68 @@ _mix_columns:
     ; out_a = (2*a) ^ (3*b) ^ c ^ d
     mov eax, r13d
     call _xtime
-    push rax                          ; 2*a
+    ; 2*a
+    push rax
     mov eax, r14d
     call _xtime
-    xor eax, r14d                     ; 3*b
+    ; 3*b
+    xor eax, r14d
     pop rcx
-    xor eax, ecx                      ; 2*a ^ 3*b
-    xor eax, r15d                     ; ^ c
-    xor eax, ebx                      ; ^ d
+    ; 2*a ^ 3*b
+    xor eax, ecx
+    ; ^ c
+    xor eax, r15d
+    ; ^ d
+    xor eax, ebx
     mov byte [rdi + r12*4], al
 
     ; out_b = a ^ (2*b) ^ (3*c) ^ d
     mov eax, r14d
     call _xtime
-    xor eax, r13d                     ; a ^ 2*b
+    ; a ^ 2*b
+    xor eax, r13d
     push rax
     mov eax, r15d
     call _xtime
-    xor eax, r15d                     ; 3*c
+    ; 3*c
+    xor eax, r15d
     pop rcx
     xor eax, ecx
-    xor eax, ebx                      ; ^ d
+    ; ^ d
+    xor eax, ebx
     mov byte [rdi + r12*4 + 1], al
 
     ; out_c = a ^ b ^ (2*c) ^ (3*d)
     mov eax, r15d
     call _xtime
-    xor eax, r13d                     ; a ^ 2*c
+    ; a ^ 2*c
+    xor eax, r13d
     push rax
     mov eax, ebx
     call _xtime
-    xor eax, ebx                      ; 3*d
+    ; 3*d
+    xor eax, ebx
     pop rcx
     xor eax, ecx
-    xor eax, r14d                     ; ^ b
+    ; ^ b
+    xor eax, r14d
     mov byte [rdi + r12*4 + 2], al
 
     ; out_d = (3*a) ^ b ^ c ^ (2*d)
     mov eax, r13d
     call _xtime
-    xor eax, r13d                     ; 3*a
+    ; 3*a
+    xor eax, r13d
     push rax
     mov eax, ebx
-    call _xtime                       ; 2*d
+    ; 2*d
+    call _xtime
     pop rcx
     xor eax, ecx
-    xor eax, r14d                     ; ^ b
-    xor eax, r15d                     ; ^ c
+    ; ^ b
+    xor eax, r14d
+    ; ^ c
+    xor eax, r15d
     mov byte [rdi + r12*4 + 3], al
 
     inc r12d
@@ -870,192 +867,256 @@ _inv_mix_columns:
     xor r12d, r12d
 
 .imc_col:
-    movzx r13d, byte [rdi + r12*4]      ; a
-    movzx r14d, byte [rdi + r12*4 + 1]  ; b
-    movzx r15d, byte [rdi + r12*4 + 2]  ; c
-    movzx ebx,  byte [rdi + r12*4 + 3]  ; d
+    ; a
+    movzx r13d, byte [rdi + r12*4]
+    ; b
+    movzx r14d, byte [rdi + r12*4 + 1]
+    ; c
+    movzx r15d, byte [rdi + r12*4 + 2]
+    ; d
+    movzx ebx,  byte [rdi + r12*4 + 3]
 
     ; out_a = (0e * a) ^ (0b * b) ^ (0d * c) ^ (09 * d)
     mov eax, r13d
     call _xtime
-    mov ecx, eax                       ; 2a
+    ; 2a
+    mov ecx, eax
     mov eax, r13d
     call _xtime
-    call _xtime                        ; 4a
+    ; 4a
+    call _xtime
     xor ecx, eax
     mov eax, r13d
-    call _xtime                        ; 2a
-    call _xtime                        ; 4a
-    call _xtime                        ; 8a
-    xor ecx, eax                       ; ecx = 0e * a
+    ; 2a
+    call _xtime
+    ; 4a
+    call _xtime
+    ; 8a
+    call _xtime
+    ; ecx = 0e * a
+    xor ecx, eax
 
     mov eax, r14d
-    call _xtime                        ; 2b
+    ; 2b
+    call _xtime
     mov edx, eax
-    xor edx, r14d                      ; 3b
+    ; 3b
+    xor edx, r14d
     mov eax, r14d
     call _xtime
     call _xtime
-    call _xtime                        ; 8b
+    ; 8b
+    call _xtime
     xor edx, eax
-    xor ecx, edx                       ; ^ 0b * b
+    ; ^ 0b * b
+    xor ecx, edx
 
     mov eax, r15d
     call _xtime
-    call _xtime                        ; 4c
+    ; 4c
+    call _xtime
     mov edx, eax
-    xor edx, r15d                      ; 4c ^ c
+    ; 4c ^ c
+    xor edx, r15d
     mov eax, r15d
     call _xtime
     call _xtime
-    call _xtime                        ; 8c
+    ; 8c
+    call _xtime
     xor edx, eax
-    xor ecx, edx                       ; ^ 0d * c
+    ; ^ 0d * c
+    xor ecx, edx
 
     mov eax, ebx
     call _xtime
     call _xtime
-    call _xtime                        ; 8d
+    ; 8d
+    call _xtime
     xor eax, ebx
-    xor ecx, eax                       ; ^ 09 * d
+    ; ^ 09 * d
+    xor ecx, eax
     mov byte [rdi + r12*4], cl
 
     ; out_b = (09 * a) ^ (0e * b) ^ (0b * c) ^ (0d * d)
     mov eax, r13d
     call _xtime
     call _xtime
-    call _xtime                        ; 8a
+    ; 8a
+    call _xtime
     xor eax, r13d
-    mov ecx, eax                       ; ecx = 09 * a
+    ; ecx = 09 * a
+    mov ecx, eax
 
     mov eax, r14d
     call _xtime
     mov edx, eax
     mov eax, r14d
     call _xtime
-    call _xtime                        ; 4b
+    ; 4b
+    call _xtime
     xor edx, eax
     mov eax, r14d
-    call _xtime                        ; 2b
-    call _xtime                        ; 4b
-    call _xtime                        ; 8b
+    ; 2b
+    call _xtime
+    ; 4b
+    call _xtime
+    ; 8b
+    call _xtime
     xor edx, eax
-    xor ecx, edx                       ; ^ 0e * b
+    ; ^ 0e * b
+    xor ecx, edx
 
     mov eax, r15d
-    call _xtime                        ; 2c
+    ; 2c
+    call _xtime
     mov edx, eax
-    xor edx, r15d                      ; 3c
+    ; 3c
+    xor edx, r15d
     mov eax, r15d
     call _xtime
     call _xtime
-    call _xtime                        ; 8c
+    ; 8c
+    call _xtime
     xor edx, eax
-    xor ecx, edx                       ; ^ 0b * c
+    ; ^ 0b * c
+    xor ecx, edx
 
     mov eax, ebx
     call _xtime
-    call _xtime                        ; 4d
+    ; 4d
+    call _xtime
     mov edx, eax
-    xor edx, ebx                       ; 4d ^ d
+    ; 4d ^ d
+    xor edx, ebx
     mov eax, ebx
     call _xtime
     call _xtime
-    call _xtime                        ; 8d
+    ; 8d
+    call _xtime
     xor edx, eax
-    xor ecx, edx                       ; ^ 0d * d
+    ; ^ 0d * d
+    xor ecx, edx
     mov byte [rdi + r12*4 + 1], cl
 
     ; out_c = (0d * a) ^ (09 * b) ^ (0e * c) ^ (0b * d)
     mov eax, r13d
     call _xtime
-    call _xtime                        ; 4a
+    ; 4a
+    call _xtime
     mov edx, eax
     xor edx, r13d
     mov eax, r13d
     call _xtime
     call _xtime
-    call _xtime                        ; 8a
+    ; 8a
+    call _xtime
     xor edx, eax
-    mov ecx, edx                       ; ecx = 0d * a
+    ; ecx = 0d * a
+    mov ecx, edx
 
     mov eax, r14d
     call _xtime
     call _xtime
-    call _xtime                        ; 8b
+    ; 8b
+    call _xtime
     xor eax, r14d
-    xor ecx, eax                       ; ^ 09 * b
+    ; ^ 09 * b
+    xor ecx, eax
 
     mov eax, r15d
-    call _xtime                        ; 2c
+    ; 2c
+    call _xtime
     mov edx, eax
     mov eax, r15d
     call _xtime
-    call _xtime                        ; 4c
+    ; 4c
+    call _xtime
     xor edx, eax
     mov eax, r15d
-    call _xtime                        ; 2c
-    call _xtime                        ; 4c
-    call _xtime                        ; 8c
+    ; 2c
+    call _xtime
+    ; 4c
+    call _xtime
+    ; 8c
+    call _xtime
     xor edx, eax
-    xor ecx, edx                       ; ^ 0e * c
+    ; ^ 0e * c
+    xor ecx, edx
 
     mov eax, ebx
-    call _xtime                        ; 2d
+    ; 2d
+    call _xtime
     mov edx, eax
-    xor edx, ebx                       ; 3d
+    ; 3d
+    xor edx, ebx
     mov eax, ebx
     call _xtime
     call _xtime
-    call _xtime                        ; 8d
+    ; 8d
+    call _xtime
     xor edx, eax
-    xor ecx, edx                       ; ^ 0b * d
+    ; ^ 0b * d
+    xor ecx, edx
     mov byte [rdi + r12*4 + 2], cl
 
     ; out_d = (0b * a) ^ (0d * b) ^ (09 * c) ^ (0e * d)
     mov eax, r13d
-    call _xtime                        ; 2a
+    ; 2a
+    call _xtime
     mov edx, eax
     xor edx, r13d
     mov eax, r13d
     call _xtime
     call _xtime
-    call _xtime                        ; 8a
+    ; 8a
+    call _xtime
     xor edx, eax
-    mov ecx, edx                       ; ecx = 0b * a
+    ; ecx = 0b * a
+    mov ecx, edx
 
     mov eax, r14d
     call _xtime
-    call _xtime                        ; 4b
+    ; 4b
+    call _xtime
     mov edx, eax
     xor edx, r14d
     mov eax, r14d
     call _xtime
     call _xtime
-    call _xtime                        ; 8b
+    ; 8b
+    call _xtime
     xor edx, eax
-    xor ecx, edx                       ; ^ 0d * b
+    ; ^ 0d * b
+    xor ecx, edx
 
     mov eax, r15d
     call _xtime
     call _xtime
-    call _xtime                        ; 8c
+    ; 8c
+    call _xtime
     xor eax, r15d
-    xor ecx, eax                       ; ^ 09 * c
+    ; ^ 09 * c
+    xor ecx, eax
 
     mov eax, ebx
-    call _xtime                        ; 2d
+    ; 2d
+    call _xtime
     mov edx, eax
     mov eax, ebx
     call _xtime
-    call _xtime                        ; 4d
+    ; 4d
+    call _xtime
     xor edx, eax
     mov eax, ebx
-    call _xtime                        ; 2d
-    call _xtime                        ; 4d
-    call _xtime                        ; 8d
+    ; 2d
+    call _xtime
+    ; 4d
+    call _xtime
+    ; 8d
+    call _xtime
     xor edx, eax
-    xor ecx, edx                       ; ^ 0e * d
+    ; ^ 0e * d
+    xor ecx, edx
     mov byte [rdi + r12*4 + 3], cl
 
     inc r12d
@@ -1091,8 +1152,10 @@ aes128_encrypt_block:
     push r14
     sub rsp, 16
 
-    mov r12, rsi                         ; save round_keys base
-    mov r14, rdx                         ; save output pointer
+    ; save round_keys base
+    mov r12, rsi
+    ; save output pointer
+    mov r14, rdx
 
     ; Copy block to stack for working state
     mov rax, [rdi]
@@ -1158,8 +1221,10 @@ aes128_decrypt_block:
     push r14
     sub rsp, 16
 
-    mov r12, rsi                         ; save base round_keys
-    mov r14, rdx                         ; save output pointer
+    ; save base round_keys
+    mov r12, rsi
+    ; save output pointer
+    mov r14, rdx
 
     ; Copy block to stack
     mov rax, [rdi]
@@ -1224,27 +1289,36 @@ aes128_cbc_encrypt:
     push r13
     push r14
     push r15
-    sub rsp, 208                         ; 176 for round_keys + 16 for iv_copy + 16 for block
+    ; 176 for round_keys + 16 for iv_copy + 16 for block
+    sub rsp, 208
 
-    mov r12, rdi                         ; key
-    mov r13, rsi                         ; iv
-    mov r14, rdx                         ; plaintext
-    mov r15, rcx                         ; len
-    mov rbp, r8                          ; ciphertext output
+    ; key
+    mov r12, rdi
+    ; iv
+    mov r13, rsi
+    ; plaintext
+    mov r14, rdx
+    ; len
+    mov r15, rcx
+    ; ciphertext output
+    mov rbp, r8
 
     ; Expand key
     lea rsi, [rsp + 32]
-    call aes128_key_expand               ; rdi=key, rsi=round_keys on stack
+    ; rdi=key, rsi=round_keys on stack
+    call aes128_key_expand
 
     ; Copy IV to stack
-    lea rdi, [rsp]                       ; iv_copy at rsp
-    mov rsi, r13                         ; source iv
+    ; iv_copy at rsp
+    lea rdi, [rsp]
+    ; source iv
+    mov rsi, r13
     mov rcx, 16
     cld
     rep movsb
 
     ; Encrypt each block
-    xor r13d, r13d                       ; block index
+    xor r13d, r13d
 
 .ce_block:
     cmp r13, r15
@@ -1252,14 +1326,19 @@ aes128_cbc_encrypt:
 
     ; XOR plaintext with IV (or previous ciphertext)
     add r14, r13                         ; current plaintext ptr
-    lea rdi, [rsp + 16]                  ; block buffer
-    lea rsi, [rsp]                       ; iv
+    ; block buffer
+    lea rdi, [rsp + 16]
+    ; iv
+    lea rsi, [rsp]
     mov rcx, 16
     cld
-    rep movsb                            ; block = iv
+    ; block = iv
+    rep movsb
 
-    sub r14, r13                         ; restore plaintext
-    lea rsi, [r14 + r13]                 ; current plaintext ptr
+    ; restore plaintext
+    sub r14, r13
+    ; current plaintext ptr
+    lea rsi, [r14 + r13]
     xor ecx, ecx
 .ce_xor:
     movzx eax, byte [rsi + rcx]
@@ -1269,27 +1348,35 @@ aes128_cbc_encrypt:
     jb .ce_xor
 
     ; Encrypt block
-    lea rdi, [rsp + 16]                  ; input block
-    lea rsi, [rsp + 32]                  ; round_keys
-    mov rdx, rdi                         ; output in-place
+    ; input block
+    lea rdi, [rsp + 16]
+    ; round_keys
+    lea rsi, [rsp + 32]
+    ; output in-place
+    mov rdx, rdi
     call aes128_encrypt_block
 
     ; Copy ciphertext block to output and use as next IV
     add rbp, r13                         ; current ciphertext ptr
-    lea rsi, [rsp + 16]                  ; encrypted block
+    ; encrypted block
+    lea rsi, [rsp + 16]
     mov rdi, rbp
     mov rcx, 16
     cld
-    rep movsb                            ; copy to output
+    ; copy to output
+    rep movsb
 
     ; Copy encrypted block to IV for next round
-    lea rsi, [rbp]                       ; just wrote ciphertext here
-    lea rdi, [rsp]                       ; iv
+    ; just wrote ciphertext here
+    lea rsi, [rbp]
+    ; iv
+    lea rdi, [rsp]
     mov rcx, 16
     cld
     rep movsb
 
-    sub rbp, r13                         ; restore ciphertext base
+    ; restore ciphertext base
+    sub rbp, r13
     add r13, 16
     jmp .ce_block
 
@@ -1314,13 +1401,19 @@ aes128_cbc_decrypt:
     push r13
     push r14
     push r15
-    sub rsp, 224                         ; 176 round_keys + 16 iv + 16 block + 16 prev_block
+    ; 176 round_keys + 16 iv + 16 block + 16 prev_block
+    sub rsp, 224
 
-    mov r12, rdi                         ; key
-    mov r13, rsi                         ; iv
-    mov r14, rdx                         ; ciphertext
-    mov r15, rcx                         ; len
-    mov rbp, r8                          ; plaintext output
+    ; key
+    mov r12, rdi
+    ; iv
+    mov r13, rsi
+    ; ciphertext
+    mov r14, rdx
+    ; len
+    mov r15, rcx
+    ; plaintext output
+    mov rbp, r8
 
     ; Expand key (for decryption we use the same round_keys, just in reverse order)
     lea rsi, [rsp + 48]
@@ -1333,9 +1426,10 @@ aes128_cbc_decrypt:
     cld
     rep movsb
 
-    lea r13, [rsp + 32]                  ; r13 = iv pointer (updated each block: prev ciphertext)
+    ; iv pointer, updated each block to prev ciphertext
+    lea r13, [rsp + 32]
 
-    xor r12d, r12d                       ; block offset
+    xor r12d, r12d
 
 .cd_block:
     cmp r12, r15
@@ -1344,15 +1438,18 @@ aes128_cbc_decrypt:
     ; Decrypt ciphertext block
     mov rdi, r14
     add rdi, r12                         ; ciphertext block
-    lea rsi, [rsp + 48]                  ; round_keys
-    lea rdx, [rsp]                       ; decrypted output buffer
+    ; round_keys
+    lea rsi, [rsp + 48]
+    ; decrypted output buffer
+    lea rdx, [rsp]
     call aes128_decrypt_block
 
     ; XOR with IV
     xor ecx, ecx
 .cd_xor:
     movzx eax, byte [rsp + rcx]
-    movzx ebx, byte [r13 + rcx]         ; iv (or prev ciphertext)
+    ; iv (or prev ciphertext)
+    movzx ebx, byte [r13 + rcx]
     xor eax, ebx
     mov [rsp + rcx], al
     inc ecx
@@ -1366,7 +1463,8 @@ aes128_cbc_decrypt:
     add rsi, r12
     mov rcx, 16
     cld
-    rep movsb                            ; save current ciphertext block
+    ; save current ciphertext block
+    rep movsb
 
     ; Copy decrypted block to output
     mov rdi, rbp
@@ -1377,7 +1475,8 @@ aes128_cbc_decrypt:
     rep movsb
 
     ; Use saved ciphertext as next IV
-    lea r13, [rsp + 16]                  ; point iv at saved ciphertext
+    ; point iv at saved ciphertext
+    lea r13, [rsp + 16]
 
     add r12, 16
     jmp .cd_block

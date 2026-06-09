@@ -2,12 +2,24 @@
 
 A Slack bot written in **pure x86_64 Linux assembly**, no C, no Rust, no libc.
 
-## Goals
+## Overview
 
-- Speak **HTTP/1.1** over raw **Linux sockets** (syscalls only).
-- **TLS** (≥1.2) implemented entirely in assembly, no OpenSSL, no libtls, no external crypto.
-- Parse Slack's **WebSocket** [Events API](https://api.slack.com/apis/connections/socket) for real-time messaging.
-- Handle Slack's OAuth & signing secrets for bot tokens.
+A slack bot written in pure x86_64 assembly!
+
+### Features
+
+(These are only the currently implemented ones, see the [roadmap](roadmap.md) for the full plan)
+
+- Linux syscalls for networking (socket, connect, sendto, recvfrom).
+- TLS 1.2 record layer and handshake (ClientHello → ServerHello + Cert + ServerHelloDone).
+- SHA-256 and HMAC-SHA256 (all test vectors pass).
+- Probably Something else, lets be honest im only reupdating this list when its convenient for me.
+
+### Cool Things
+
+- The comments tell you less info than the code.
+- It probably has security issues, but they are not documented anywhere, so its fine!
+- The code is not actually that bad, if you squint.
 
 ## Why
 
@@ -17,12 +29,13 @@ Now im doing it for [Stardance](https://stardance.hackclub.com/projects/6658).
 ## Building
 
 Requires:
+- `make`
 - `nasm`
 - `ld` (GNU ld)
 - Linux x86_64
 
 ```console
-$ nasm -f elf64 -o slack.o slack.asm && ld -o slack slack.o
+$ make
 ```
 
 ## Target
@@ -31,23 +44,13 @@ $ nasm -f elf64 -o slack.o slack.asm && ld -o slack slack.o
 - **Syscall ABI:** `syscall` instruction, kernel calling convention
 - **Calling convention:** System V AMD64 (for any interop, though there shouldn't be any)
 
-## Project structure
-
-```
-slack.asm        — entry point, main loop
-socket.asm       — socket(), connect(), send(), recv(), close() syscall wrappers
-tls.asm          — TLS 1.2 handshake & record layer (placeholder stubs)
-util.asm         — sockaddr_in construction, errno helpers
-test.asm         — test harness for the syscall / util layer
-```
-
 ## Running the bot
 
 Use the docker compose file..
 
 ## Running the code without docker
 
-Run run.sh script.
+Run run.sh script or do ./slack directly.
 
 ## License
 

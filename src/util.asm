@@ -19,17 +19,14 @@ make_sockaddr_in:
     ; rdi = dst, rsi = port, rdx = ip
     mov word [rdi], AF_INET
 
-    ; swap bytes of ax
     mov ax, si
     rol ax, 8
     mov word [rdi + 2], ax
 
-    ; byte-swap eax
     mov eax, edx
     bswap eax
     mov dword [rdi + 4], eax
 
-    ; zero sin_zero
     mov qword [rdi + 8], 0
 
     mov eax, 16

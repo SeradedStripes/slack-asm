@@ -15,7 +15,7 @@
 - [x] TLS record layer (`tls_send`/`tls_recv`, loopback-tested via socketpair).
 - [x] TLS 1.2 handshake, specifically ClientHello → ServerHello + Cert + ServerHelloDone (tested via fork+loopback).
 - [ ] TLS 1.3 support if required by Slack.
-- [ ] AES-CBC / AES-GCM, key derivation.
+- [x] AES-128-CBC.
 - [ ] Certificate parsing (DER) and basic validation.
 - [ ] Integrate with socket layer so all Slack traffic is tunneled over TLS.
 

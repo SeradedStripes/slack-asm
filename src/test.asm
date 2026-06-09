@@ -1,4 +1,4 @@
-; Tests for various components of the libraries implemeted in the repo.
+; Tests for various components of the libraries implemented in the repo.
 
 BITS 64
 default rel
@@ -151,7 +151,8 @@ server_resp:
     db 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17
     db 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f
     db 32                     ; session_id length
-    times 32 db 0xaa          ; session_id
+    ; session_id
+    times 32 db 0xaa
     db 0x00, 0x3C             ; cipher suite: TLS_RSA_WITH_AES_128_CBC_SHA256
     db 0x00                   ; compression: null
     db 0x00, 0x00             ; extensions length: 0
@@ -520,7 +521,8 @@ test_harness:
     rep movsb
     lea rsi, [rel prf_seed]
     mov rcx, prf_seed_len
-    rep movsb                     ; rsp[0..17] = seed_buf
+    ; rsp[0..17] = seed_buf
+    rep movsb
 
     ; Compute A(1) = HMAC(secret, seed_buf)
     lea rdi, [rel prf_secret]
@@ -528,7 +530,8 @@ test_harness:
     mov rdx, rsp
     mov rcx, prf_label_len
     add rcx, prf_seed_len
-    lea r8, [rsp + 32]           ; A(1) at rsp+32
+    ; A(1) at rsp+32
+    lea r8, [rsp + 32]
     call hmac_sha256
 
     ; Build inbuf = A(1) + seed_buf at rsp+64
@@ -548,7 +551,8 @@ test_harness:
     mov rcx, 32
     add rcx, prf_label_len
     add rcx, prf_seed_len        ; inbuf_len = 32 + seed_buf_len
-    lea r8, [rsp + 96]           ; iter1 at rsp+96
+    ; iter1 at rsp+96
+    lea r8, [rsp + 96]
     call hmac_sha256
 
     ; Compare iter1 with expected first 32 bytes
@@ -638,7 +642,8 @@ test_harness:
     rep movsb
     lea rsi, [rel kdf_server_random]
     mov rcx, 32
-    rep movsb       ; rsp[0..76] = seed_buf
+    ; rsp[0..76] = seed_buf
+    rep movsb
 
     ; A(1) = HMAC(pre_master, seed_buf) into recv_buf
     lea rdi, [rel kdf_pre_master]
@@ -669,7 +674,8 @@ test_harness:
     rep movsb
     lea rsi, [rel kdf_server_random]
     mov rcx, 32
-    rep movsb       ; rsp[0..108] = A(1)+seed_buf
+    ; rsp[0..108] = A(1)+seed_buf
+    rep movsb
 
     ; iter1 = HMAC(pre_master, inbuf) into recv_buf + 32
     lea rdi, [rel kdf_pre_master]
@@ -712,8 +718,10 @@ test_harness:
     test eax, eax
     jnz .tls_fail
 
-    mov ebx, [rsp]          ; sv[0] write end
-    mov ebp, [rsp + 4]      ; sv[1] read end
+    ; sv[0] write end
+    mov ebx, [rsp]
+    ; sv[1] read end
+    mov ebp, [rsp + 4]
 
     ; Initialize TLS context
     lea rdi, [rsp + 8]
@@ -730,11 +738,16 @@ test_harness:
     jl .tls_fail
 
     ; Receive TLS record via tls_recv
-    lea rdi, [rsp + 8]       ; ctx
-    mov esi, ebp             ; fd = sv[1]
-    lea rdx, [rsp + 128]    ; out_type
-    lea rcx, [rsp + 144]    ; out_data
-    lea r8, [rsp + 136]     ; out_len
+    ; ctx
+    lea rdi, [rsp + 8]
+    ; fd = sv[1]
+    mov esi, ebp
+    ; out_type
+    lea rdx, [rsp + 128]
+    ; out_data
+    lea rcx, [rsp + 144]
+    ; out_len
+    lea r8, [rsp + 136]
     call tls_recv
     test eax, eax
     jnz .tls_fail
@@ -783,14 +796,18 @@ test_harness:
     test eax, eax
     jnz .hs_fail
 
-    mov ebx, [rsp]          ; sv[0] client end
-    mov ebp, [rsp + 4]      ; sv[1] server end
+    ; sv[0] client end
+    mov ebx, [rsp]
+    ; sv[1] server end
+    mov ebp, [rsp + 4]
 
     ; Fork
-    mov eax, 57             ; SYS_fork
+    ; SYS_fork
+    mov eax, 57
     syscall
     test eax, eax
-    js .hs_fail             ; fork failed
+    ; fork failed
+    js .hs_fail
     jnz .hs_parent
 
     ; --- Child process (TLS server) ---
@@ -816,7 +833,8 @@ test_harness:
     mov edi, ebp
     call sys_close
     xor edi, edi
-    mov eax, 60             ; SYS_exit
+    ; SYS_exit
+    mov eax, 60
     syscall
 
 .hs_parent:
@@ -830,36 +848,48 @@ test_harness:
     call tls_init
 
     ; Run handshake
-    lea rdi, [rsp + 8]      ; ctx
-    mov esi, ebx            ; fd
-    xor edx, edx            ; hostname = NULL
-    xor ecx, ecx            ; hostlen = 0
+    ; ctx
+    lea rdi, [rsp + 8]
+    ; fd
+    mov esi, ebx
+    ; hostname = NULL
+    xor edx, edx
+    ; hostlen = 0
+    xor ecx, ecx
     call tls_client_start
     test eax, eax
     jnz .hs_fail
 
     ; Verify handshake completed
     lea rdi, [rsp + 8]
-    cmp byte [rdi + 117], HS_DONE            ; tls_ctx.hs_state
+    ; tls_ctx.hs_state
+    cmp byte [rdi + 117], HS_DONE
     jne .hs_fail
 
     ; Verify cipher suite was parsed (TLS_RSA_WITH_AES_128_CBC_SHA256 = 0x003C)
     lea rdi, [rsp + 8]
-    mov ax, [rdi + 115]            ; tls_ctx.cipher_suite
+    ; tls_ctx.cipher_suite
+    mov ax, [rdi + 115]
     cmp ax, 0x003C
     jne .hs_fail
 
     ; Verify session_id was parsed
     lea rdi, [rsp + 8]
-    cmp byte [rdi + 114], 32        ; tls_ctx.session_id_len
+    ; tls_ctx.session_id_len
+    cmp byte [rdi + 114], 32
     jne .hs_fail
 
     ; Wait for child to finish
-    mov edi, -1              ; any child
-    xor esi, esi             ; NULL status
-    xor edx, edx             ; no options
-    xor r10d, r10d           ; no rusage
-    mov eax, 61              ; SYS_wait4
+    ; any child
+    mov edi, -1
+    ; NULL status
+    xor esi, esi
+    ; no options
+    xor edx, edx
+    ; no rusage
+    xor r10d, r10d
+    ; SYS_wait4
+    mov eax, 61
     syscall
 
     ; Cleanup
@@ -944,12 +974,17 @@ test_harness:
 
     ; Build mac_input at rsp+160 (seq||type||ver||len||frag)
     xor eax, eax
-    mov qword [rsp + 160], 0  ; seq_num = 0 (8 bytes)
+    ; seq_num = 0 (8 bytes)
+    mov qword [rsp + 160], 0
     mov byte [rsp + 168], TLS_APPLICATION_DATA
-    mov byte [rsp + 169], 3   ; version major = 3
-    mov byte [rsp + 170], 3   ; version minor = 3
-    mov byte [rsp + 171], 0   ; fragment length high
-    mov byte [rsp + 172], 3   ; fragment length low
+    ; version major = 3
+    mov byte [rsp + 169], 3
+    ; version minor = 3
+    mov byte [rsp + 170], 3
+    ; fragment length high
+    mov byte [rsp + 171], 0
+    ; fragment length low
+    mov byte [rsp + 172], 3
     mov byte [rsp + 173], 'a'
     mov byte [rsp + 174], 'b'
     mov byte [rsp + 175], 'c'
@@ -987,41 +1022,52 @@ test_harness:
     ; Encrypt with AES-128-CBC
     ; Generate a dummy IV (16 bytes of zeros)
     xor eax, eax
-    mov qword [rsp + 128], rax    ; reuse rsp+128 as IV area
+    ; reuse rsp+128 as IV area
+    mov qword [rsp + 128], rax
     mov qword [rsp + 136], rax
 
     lea rdi, [rel client_write_key]
-    lea rsi, [rsp + 128]          ; IV
-    lea rdx, [rsp + 160]          ; plaintext (48 bytes)
+    ; IV
+    lea rsi, [rsp + 128]
+    ; plaintext (48 bytes)
+    lea rdx, [rsp + 160]
     mov rcx, 48
-    lea r8, [rsp + 160]           ; ciphertext output (in-place)
+    ; ciphertext output (in-place)
+    lea r8, [rsp + 160]
     call aes128_cbc_encrypt
 
     ; Decrypt with AES-128-CBC
     lea rdi, [rel client_write_key]
-    lea rsi, [rsp + 128]          ; same IV
-    lea rdx, [rsp + 160]          ; ciphertext
+    ; same IV
+    lea rsi, [rsp + 128]
+    ; ciphertext
+    lea rdx, [rsp + 160]
     mov rcx, 48
-    lea r8, [rsp + 128]           ; decrypted output (reuse IV area)
+    ; decrypted output (reuse IV area)
+    lea r8, [rsp + 128]
     call aes128_cbc_decrypt
 
     ; Strip padding: last byte = pad value
     lea rsi, [rsp + 128]
     add rsi, 48
     dec rsi
-    movzx eax, byte [rsi]         ; pad_value
+    ; pad_value
+    movzx eax, byte [rsi]
     mov ecx, eax
     sub ecx, 48
-    neg ecx                        ; ecx = unpadded length
+    ; ecx = unpadded length
+    neg ecx
 
     ; Verify unpadded length = 35 (3 fragment + 32 MAC)
     cmp ecx, 35
     jne .enc_fail
 
     ; Verify fragment "abc" (first 3 bytes)
-    cmp word [rsp + 128], 0x6261            ; "ab"
+    ; "ab"
+    cmp word [rsp + 128], 0x6261
     jne .enc_fail
-    cmp byte [rsp + 130], 0x63              ; "c"
+    ; "c"
+    cmp byte [rsp + 130], 0x63
     jne .enc_fail
 
     add rsp, 224

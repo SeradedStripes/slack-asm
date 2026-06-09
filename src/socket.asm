@@ -52,8 +52,10 @@ sys_recv:
 ; int sys_socketpair(int domain, int type, int protocol, int sv[2])
 ; rdi=domain, rsi=type, rdx=protocol, rcx=sv
 sys_socketpair:
-    mov rax, 53  ; SYS_socketpair
-    mov r10, rcx ; sv array pointer in r10 (per syscall convention)
+    ; SYS_socketpair
+    mov rax, 53
+    ; sv array pointer in r10 (per syscall convention)
+    mov r10, rcx
     syscall
     ret
 
