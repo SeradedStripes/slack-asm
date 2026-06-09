@@ -5,7 +5,7 @@ NASM := nasm
 NASMFLAGS := -f elf64
 LD := ld
 
-.PHONY: all clean
+.PHONY: all clean test run
 
 all: slack
 
@@ -17,4 +17,12 @@ slack: $(OBJS)
 
 clean:
 	rm -f $(OBJS) slack
+
+test: all
+	@echo "Running tests (binary: ./slack)"
+	./slack
+
+run: all
+	@echo "Running slack"
+	./slack
 
