@@ -1,6 +1,9 @@
 # Object files
 **/*.o
 
+# Der files
+**/*.der
+
 # Build Binaries
 **/slack
 
