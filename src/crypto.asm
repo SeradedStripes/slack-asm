@@ -88,10 +88,12 @@ sha256_update:
     lea rdi, [r12 + SHA256_BUFFER + rbx]
     mov rsi, r13
     mov rdx, rcx
+    push rcx
     call memcpy_internal
     mov rdi, r12
     lea rsi, [r12 + SHA256_BUFFER]
     call sha256_transform
+    pop rcx
     add r13, rcx
     sub rbp, rcx
 

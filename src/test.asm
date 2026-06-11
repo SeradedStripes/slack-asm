@@ -18,7 +18,9 @@ extern sys_socketpair
 extern sys_send
 extern sys_recv
 extern sys_close
-extern tls_client_start
+  extern tls_client_start
+  extern tls_connect
+  extern tls_disconnect
   extern tls_prf
   extern tls_derive_keys
   extern master_secret
@@ -36,9 +38,17 @@ extern tls_client_start
   extern cert_not_after
   extern server_pubkey_n_len
   extern server_pubkey_e_len
+  extern pre_master_sec
+  extern tls_sha256_ctx
+  extern tls_digest
+  extern _read_exactly
 
 %define TLS_APPLICATION_DATA 23
 %define HS_DONE 3
+%define TLS_HANDSHAKE 22
+%define TLS_CHANGE_CIPHER_SPEC 20
+%define HS_FINISHED 20
+%define FINISHED_LEN 12
 
 section .rodata
 sock_ok:       db "socket ok", 10
@@ -175,6 +185,9 @@ server_resp_end:
 server_resp_len equ $ - server_resp
 test_cert_der_len equ test_cert_der_end - test_cert_der
 
+sf_label:    db "server finished"
+sf_label_len: equ $ - sf_label
+
 msg_pass:     db "all tests passed", 10
 msg_pass_len: equ $ - msg_pass
 msg_fail:     db "test failed", 10
@@ -300,6 +313,311 @@ aes_decrypted: resb 16
 
 section .text
 global test_harness
+
+; Complete server-side handshake after sending ServerHello/Cert/SHD.
+; rdi = fd (server end of socketpair)
+; rsi = pointer to received ClientHello (with TLS record header)
+; edx = total received ClientHello length
+_server_finish_handshake:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 320
+    ; [rsp+0]:   tls_ctx (118 bytes)
+    ; [rsp+128]: recv_iv (16 bytes)
+    ; [rsp+144]: mac_in (48 bytes)
+    ; [rsp+192]: mac_out (32 bytes)
+    ; [rsp+224]: verify_data (16 bytes)
+    ; [rsp+240]: plaintext (64 bytes)
+    ; [rsp+304]: header_buf (8 bytes)
+
+    mov r12d, edi
+    mov r13, rsi
+    mov r14d, edx
+
+    lea rdi, [rsp]
+    call tls_init
+
+    lea rsi, [r13 + 11]
+    lea rdi, [rsp + 18]
+    mov rcx, 32
+    cld
+    rep movsb
+
+    lea rsi, [rel server_resp + 11]
+    lea rdi, [rsp + 50]
+    mov rcx, 32
+    cld
+    rep movsb
+
+    lea rdi, [rsp]
+    lea rsi, [rel pre_master_sec]
+    mov edx, 48
+    call tls_derive_keys
+
+    lea rdi, [rel tls_sha256_ctx]
+    call sha256_init
+
+    ; Hash ClientHello (skip TLS record header)
+    lea rdi, [rel tls_sha256_ctx]
+    lea rsi, [r13 + 5]
+    lea edx, [r14d - 5]
+    call sha256_update
+
+    ; Hash ServerHello (at server_resp + 5, size 76)
+    lea rdi, [rel tls_sha256_ctx]
+    lea rsi, [rel server_resp + 5]
+    mov edx, 76
+    call sha256_update
+
+    ; Hash Certificate (at server_resp + 81, size 937)
+    lea rdi, [rel tls_sha256_ctx]
+    lea rsi, [rel server_resp + 81]
+    mov edx, 937
+    call sha256_update
+
+    ; Hash ServerHelloDone (at server_resp + 1018, size 4)
+    lea rdi, [rel tls_sha256_ctx]
+    lea rsi, [rel server_resp + 1018]
+    mov edx, 4
+    call sha256_update
+
+    ; ---- Receive CKE ----
+    mov edi, r12d
+    lea rsi, [rsp + 304]
+    mov edx, 5
+    call _read_exactly
+    test eax, eax
+    js .sfh_error
+    cmp byte [rsp + 304], TLS_HANDSHAKE
+    jne .sfh_error
+
+    mov ax, [rsp + 307]
+    ror ax, 8
+    movzx r15d, ax
+
+    mov edi, r12d
+    lea rsi, [rel recv_buf]
+    mov edx, r15d
+    call _read_exactly
+    test eax, eax
+    js .sfh_error
+
+    lea rdi, [rel tls_sha256_ctx]
+    lea rsi, [rel recv_buf]
+    mov edx, r15d
+    call sha256_update
+
+    ; ---- Receive CCS ----
+    mov edi, r12d
+    lea rsi, [rsp + 304]
+    mov edx, 5
+    call _read_exactly
+    test eax, eax
+    js .sfh_error
+    cmp byte [rsp + 304], TLS_CHANGE_CIPHER_SPEC
+    jne .sfh_error
+
+    mov edi, r12d
+    lea rsi, [rsp + 304]
+    mov edx, 1
+    call _read_exactly
+    test eax, eax
+    js .sfh_error
+    cmp byte [rsp + 304], 1
+    jne .sfh_error
+
+    ; ---- Receive client Finished (encrypted) ----
+    mov edi, r12d
+    lea rsi, [rsp + 304]
+    mov edx, 5
+    call _read_exactly
+    test eax, eax
+    js .sfh_error
+    cmp byte [rsp + 304], TLS_HANDSHAKE
+    jne .sfh_error
+
+    mov ax, [rsp + 307]
+    ror ax, 8
+    movzx r15d, ax
+
+    mov edi, r12d
+    lea rsi, [rel recv_buf]
+    mov edx, r15d
+    call _read_exactly
+    test eax, eax
+    js .sfh_error
+
+    cmp r15d, 17
+    jb .sfh_error
+
+    lea rdi, [rsp + 128]
+    lea rsi, [rel recv_buf]
+    mov rcx, 16
+    cld
+    rep movsb
+
+    lea rdi, [rel client_write_key]
+    lea rsi, [rsp + 128]
+    lea rdx, [rel recv_buf + 16]
+    mov ecx, r15d
+    sub ecx, 16
+    lea r8, [rel recv_buf + 16]
+    call aes128_cbc_decrypt
+
+    ; Strip PKCS#7 padding
+    mov ecx, r15d
+    sub ecx, 16
+    lea rsi, [rel recv_buf + 16]
+    add rsi, rcx
+    dec rsi
+    movzx eax, byte [rsi]
+    cmp eax, 16
+    ja .sfh_error
+    test eax, eax
+    jz .sfh_error
+    mov ebx, eax
+    sub ecx, ebx
+    sub ecx, 32
+    js .sfh_error
+    cmp byte [rel recv_buf + 16], HS_FINISHED
+    jne .sfh_error
+
+    mov edx, ecx
+    lea rdi, [rel tls_sha256_ctx]
+    lea rsi, [rel recv_buf + 16]
+    call sha256_update
+
+    lea rdi, [rel tls_sha256_ctx]
+    lea rsi, [rel tls_digest]
+    call sha256_final
+
+    ; ---- Compute server Finished verify_data ----
+    lea rdi, [rel master_secret]
+    mov esi, 48
+    lea rdx, [rel sf_label]
+    mov ecx, sf_label_len
+    lea r8, [rel tls_digest]
+    mov r9d, 32
+    push 12
+    lea rax, [rsp + 232]
+    push rax
+    call tls_prf
+    add rsp, 16
+
+    ; ---- Send CCS ----
+    mov byte [rsp + 304], TLS_CHANGE_CIPHER_SPEC
+    mov word [rsp + 305], (3 << 8) | 3
+    mov word [rsp + 307], 0x0001
+    mov edi, r12d
+    lea rsi, [rsp + 304]
+    mov edx, 5
+    xor ecx, ecx
+    call sys_send
+    test rax, rax
+    js .sfh_error
+    mov byte [rsp + 304], 1
+    mov edi, r12d
+    lea rsi, [rsp + 304]
+    mov edx, 1
+    xor ecx, ecx
+    call sys_send
+    test rax, rax
+    js .sfh_error
+
+    ; ---- Build and send server Finished (encrypted) ----
+    mov byte [rsp + 240], HS_FINISHED
+    mov byte [rsp + 241], 0
+    mov byte [rsp + 242], 0
+    mov byte [rsp + 243], FINISHED_LEN
+    lea rsi, [rsp + 232]
+    lea rdi, [rsp + 244]
+    mov rcx, FINISHED_LEN
+    cld
+    rep movsb
+
+    xor eax, eax
+    mov qword [rsp + 144], rax
+    mov byte [rsp + 152], TLS_HANDSHAKE
+    mov word [rsp + 153], (3 << 8) | 3
+    mov word [rsp + 155], 0x0010
+
+    lea rdi, [rel server_write_mac_key]
+    mov rsi, 32
+    lea rdx, [rsp + 144]
+    mov rcx, 29
+    lea r8, [rsp + 192]
+    call hmac_sha256
+
+    lea rdi, [rsp + 240]
+    add rdi, 48
+    mov ecx, 16
+    mov al, 16
+.sfh_pad:
+    mov byte [rdi], al
+    inc rdi
+    dec ecx
+    jnz .sfh_pad
+
+.zero_iv:
+    lea rdi, [rsp + 128]
+    mov esi, 16
+    xor edx, edx
+    mov eax, 318
+    syscall
+
+    lea rdi, [rel server_write_key]
+    lea rsi, [rsp + 128]
+    lea rdx, [rsp + 240]
+    mov ecx, 64
+    lea r8, [rsp + 240]
+    call aes128_cbc_encrypt
+
+    mov byte [rsp + 304], TLS_HANDSHAKE
+    mov word [rsp + 305], (3 << 8) | 3
+    mov word [rsp + 307], 0x0050
+    mov edi, r12d
+    lea rsi, [rsp + 304]
+    mov edx, 5
+    xor ecx, ecx
+    call sys_send
+    test rax, rax
+    js .sfh_error
+
+    mov edi, r12d
+    lea rsi, [rsp + 128]
+    mov edx, 16
+    xor ecx, ecx
+    call sys_send
+    test rax, rax
+    js .sfh_error
+
+    mov edi, r12d
+    lea rsi, [rsp + 240]
+    mov edx, 64
+    xor ecx, ecx
+    call sys_send
+    test rax, rax
+    js .sfh_error
+
+    xor eax, eax
+    jmp .sfh_done
+
+.sfh_error:
+    or eax, -1
+
+.sfh_done:
+    add rsp, 320
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
 
 test_harness:
     push rbx
@@ -814,6 +1132,14 @@ test_harness:
     ; sv[1] server end
     mov ebp, [rsp + 4]
 
+    ; Generate pre-master secret BEFORE fork so child shares it
+    mov word [rel pre_master_sec], 0x0303
+    lea rdi, [rel pre_master_sec + 2]
+    mov esi, 46
+    xor edx, edx
+    mov eax, 318
+    syscall
+
     ; Fork
     ; SYS_fork
     mov eax, 57
@@ -834,6 +1160,8 @@ test_harness:
     mov edx, 4096
     xor ecx, ecx
     call sys_recv
+    ; save received length
+    mov ebx, eax
 
     ; Send server response
     mov edi, ebp
@@ -841,6 +1169,12 @@ test_harness:
     mov edx, server_resp_len
     xor ecx, ecx
     call sys_send
+
+    ; Complete server side of handshake (CKE, CCS, Finished exchange)
+    mov edi, ebp
+    lea rsi, [recv_buf]
+    mov edx, ebx
+    call _server_finish_handshake
 
     ; Close and exit
     mov edi, ebp
@@ -927,6 +1261,117 @@ test_harness:
     jmp .fail
 
 .after_hs:
+
+    ; --- TLS connect/disconnect integration test ---
+    push rbx
+    push rbp
+    sub rsp, 144
+
+    lea rcx, [rsp]
+    mov edi, 1
+    mov esi, 1
+    xor edx, edx
+    call sys_socketpair
+    test eax, eax
+    jnz .conn_int_fail
+
+    mov ebx, [rsp]
+    mov ebp, [rsp + 4]
+
+    ; Generate pre-master secret BEFORE fork so child shares it
+    mov word [rel pre_master_sec], 0x0303
+    lea rdi, [rel pre_master_sec + 2]
+    mov esi, 46
+    xor edx, edx
+    mov eax, 318
+    syscall
+
+    mov eax, 57
+    syscall
+    test eax, eax
+    js .conn_int_fail
+    jnz .conn_int_parent
+
+    ; --- Child (TLS server) ---
+    mov edi, ebx
+    call sys_close
+
+    ; Recv ClientHello
+    mov edi, ebp
+    lea rsi, [recv_buf]
+    mov edx, 4096
+    xor ecx, ecx
+    call sys_recv
+    ; save received length
+    mov ebx, eax
+
+    ; Send server_resp (ServerHello + Cert + SHD)
+    mov edi, ebp
+    lea rsi, [server_resp]
+    mov edx, server_resp_len
+    xor ecx, ecx
+    call sys_send
+
+    ; Complete server side of handshake
+    mov edi, ebp
+    lea rsi, [recv_buf]
+    mov edx, ebx
+    call _server_finish_handshake
+
+    ; Close and exit
+    mov edi, ebp
+    call sys_close
+    xor edi, edi
+    mov eax, 60
+    syscall
+
+.conn_int_parent:
+    mov edi, ebp
+    call sys_close
+
+    ; tls_connect initializes context and runs handshake
+    lea rdi, [rsp + 8]
+    mov esi, ebx
+    xor edx, edx
+    xor ecx, ecx
+    call tls_connect
+    test eax, eax
+    jnz .conn_int_fail
+
+    ; Verify handshake completed
+    cmp byte [rsp + 8 + 117], HS_DONE
+    jne .conn_int_fail
+
+    ; Verify cipher suite parsed
+    mov ax, [rsp + 8 + 115]
+    cmp ax, 0x003C
+    jne .conn_int_fail
+
+    ; tls_disconnect sends close_notify and closes fd
+    lea rdi, [rsp + 8]
+    mov esi, ebx
+    call tls_disconnect
+
+    ; Wait for child
+    mov edi, -1
+    xor esi, esi
+    xor edx, edx
+    xor r10d, r10d
+    mov eax, 61
+    syscall
+
+    add rsp, 144
+    pop rbp
+    pop rbx
+    jmp .conn_int_done
+
+.conn_int_fail:
+    add rsp, 144
+    pop rbp
+    pop rbx
+    jmp .fail
+
+.conn_int_done:
 
     ; --- AES-CBC encrypt/decrypt round-trip test ---
     lea rdi, [rel aes_key]

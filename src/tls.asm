@@ -24,6 +24,11 @@ HS_CLIENT_HELLO        equ 1
 HS_SERVER_HELLO        equ 2
 HS_CERTIFICATE         equ 11
 HS_SERVER_HELLO_DONE   equ 14
+HS_CLIENT_KEY_EXCHANGE equ 16
+HS_FINISHED            equ 20
+
+; Finished verify_data length
+FINISHED_LEN           equ 12
 
 ; Handshake client states
 HS_WAIT_SERVER_HELLO      equ 0
@@ -47,18 +52,25 @@ struc tls_ctx
 endstruc
 tls_ctx_size equ 118
 
-extern sys_send, sys_recv
+extern sys_send, sys_recv, sys_close
 extern hmac_sha256
 extern aes128_cbc_encrypt
 extern aes128_cbc_decrypt
 extern x509_parse_cert
 extern x509_check_validity
+extern rsa_pub_encrypt
+extern sha256_init, sha256_update, sha256_final
+extern server_pubkey_n_len
 
 section .rodata
 master_label:       db "master secret"
 master_label_len:   equ $ - master_label
 key_expansion_label: db "key expansion"
 key_expansion_label_len: equ $ - key_expansion_label
+client_finished_label: db "client finished"
+client_finished_label_len: equ $ - client_finished_label
+server_finished_label: db "server finished"
+server_finished_label_len: equ $ - server_finished_label
 
 section .bss
 header_buf:  resb TLS_HEADER_SIZE
@@ -78,6 +90,9 @@ aes_round_keys:    resb 176
 mac_header_buf:    resb 13
 record_iv:         resb 16
 record_plaintext:  resb 16448  ; max fragment + 32 MAC + 16 pad
+tls_sha256_ctx:    resb 104    ; transcript hash SHA-256 context
+tls_digest:        resb 32     ; transcript hash output
+pre_master_sec:    resb 48     ; pre-master secret (shared with test)
 
 section .text
 global tls_init
@@ -93,6 +108,12 @@ global client_write_iv
 global server_write_iv
 global client_write_mac_key
 global server_write_mac_key
+global tls_connect
+global tls_disconnect
+global pre_master_sec
+global tls_sha256_ctx
+global tls_digest
+global _read_exactly
 
 ; void tls_init(struct tls_ctx *ctx)
 ; rdi = ctx pointer
@@ -272,6 +293,8 @@ tls_send:
     lea rbp, [rbx + rcx]
 
     ; Write padding bytes (PKCS#7)
+    ; r8 may have been clobbered by rep movsb / _tls_compute_mac
+    mov r8, [rsp]
     lea rdi, [record_plaintext + r8 + 32]
     ; pad byte value
     movzx ebx, cl
@@ -651,6 +674,10 @@ tls_client_start:
     mov eax, 318
     syscall
 
+    ; Initialize transcript hash
+    lea rdi, [rel tls_sha256_ctx]
+    call sha256_init
+
     ; Build ClientHello in hs_buf
     lea rsi, [rel hs_buf]
     mov rdi, r12
@@ -658,6 +685,12 @@ tls_client_start:
     ; rax = message length (49)
     test rax, rax
     js .tcs_error
+
+    ; Hash ClientHello (transcript)
+    mov rdx, rax
+    lea rdi, [rel tls_sha256_ctx]
+    lea rsi, [rel hs_buf]
+    call sha256_update
 
     ; Send as TLS Handshake record
     mov rdi, r12
@@ -819,16 +852,28 @@ tls_client_start:
     test ebx, ebx
     jnz .tcs_error
 
-    mov byte [r12 + tls_ctx.hs_state], HS_DONE
-    jmp .tcs_advance
+    ; Hash ServerHelloDone into transcript
+    lea rdi, [rel tls_sha256_ctx]
+    mov rsi, r14
+    lea edx, [ebx + 4]
+    call sha256_update
+
+    ; Don't set HS_DONE yet — CKE must be sent plaintext
+    jmp .tcs_done
 
 .tcs_advance:
+    ; Hash this handshake message into transcript
+    lea rdi, [rel tls_sha256_ctx]
+    mov rsi, r14
+    lea edx, [ebx + 4]
+    call sha256_update
+
     ; total current message size
     lea ecx, [ebx + 4]
     sub r15, rcx
     add r14, rcx
 
-    ; Check if handshake complete
+    ; Check if handshake complete (after ServerHelloDone)
     cmp byte [r12 + tls_ctx.hs_state], HS_DONE
     je .tcs_done
 
@@ -841,23 +886,206 @@ tls_client_start:
     jmp .tcs_recv_loop
 
 .tcs_done:
-    ; Generate pre_master_secret: 0x0303 + 46 random bytes
-    mov word [rsp + 16], 0x0303
-    lea rdi, [rsp + 18]
+    ; ---- Generate/use pre-master secret ----
+    cmp word [pre_master_sec], 0x0303
+    je .tcs_pms_ok
+    mov word [pre_master_sec], 0x0303
+    lea rdi, [pre_master_sec + 2]
     mov esi, 46
     xor edx, edx
-    ; getrandom
     mov eax, 318
     syscall
+.tcs_pms_ok:
 
+    ; ---- RSA-encrypt PMS into CKE body at hs_buf + 4 ----
+    lea rdi, [hs_buf + 4]
+    lea rsi, [pre_master_sec]
+    mov edx, 48
+    call rsa_pub_encrypt
+    test eax, eax
+    jnz .tcs_error
+
+    ; Build CKE handshake header (assumes n_len = 256: 00 01 00)
+    mov byte [hs_buf], HS_CLIENT_KEY_EXCHANGE
+    mov byte [hs_buf + 1], 0
+    mov byte [hs_buf + 2], 1
+    mov byte [hs_buf + 3], 0
+
+    ; Hash CKE into transcript
+    lea rdi, [tls_sha256_ctx]
+    lea rsi, [hs_buf]
+    mov edx, 260
+    call sha256_update
+
+    ; Save transcript backup (includes CKE) for server Finished
+    lea rdi, [hs_buf + 2048]
+    lea rsi, [tls_sha256_ctx]
+    mov rcx, 104
+    cld
+    rep movsb
+
+    ; Send ClientKeyExchange (plaintext, hs_state != HS_DONE)
     mov rdi, r12
-    lea rsi, [rsp + 16]
+    mov esi, r13d
+    mov edx, TLS_HANDSHAKE
+    lea rcx, [hs_buf]
+    mov r8d, 260
+    call tls_send
+    test rax, rax
+    js .tcs_error
+
+    ; Derive master secret and keys from PMS
+    mov rdi, r12
+    lea rsi, [pre_master_sec]
     mov edx, 48
     call tls_derive_keys
 
     ; Validate certificate validity period
     call x509_check_validity
     test eax, eax
+    jnz .tcs_error
+
+    ; Finalize transcript hash → tls_digest (client Finished verify_data)
+    lea rdi, [tls_sha256_ctx]
+    lea rsi, [tls_digest]
+    call sha256_final
+
+    ; ---- Send ChangeCipherSpec (plaintext) ----
+    ; TLS record header
+    mov byte [header_buf], TLS_CHANGE_CIPHER_SPEC
+    mov word [header_buf + 1], (TLS_VERSION_MAJOR << 8) | TLS_VERSION_MINOR
+    mov word [header_buf + 3], 0x0001
+    mov edi, r13d
+    lea rsi, [header_buf]
+    mov edx, TLS_HEADER_SIZE
+    xor ecx, ecx
+    call sys_send
+    test rax, rax
+    js .tcs_error
+    ; CCS body (0x01)
+    mov byte [header_buf], 1
+    mov edi, r13d
+    lea rsi, [header_buf]
+    mov edx, 1
+    xor ecx, ecx
+    call sys_send
+    test rax, rax
+    js .tcs_error
+
+    ; Set encryption state (subsequent records are encrypted)
+    mov byte [r12 + tls_ctx.hs_state], HS_DONE
+
+    ; ---- Compute client Finished verify_data ----
+    ; PRF(master_secret, 48, "client finished", label_len, tls_digest, 32, hs_buf+48, 12)
+    lea rdi, [master_secret]
+    mov esi, 48
+    lea rdx, [client_finished_label]
+    mov ecx, client_finished_label_len
+    lea r8, [tls_digest]
+    mov r9d, 32
+    push 12
+    lea rax, [hs_buf + 48]
+    push rax
+    call tls_prf
+    add rsp, 16
+
+    ; Build Finished handshake message at hs_buf
+    mov byte [hs_buf], HS_FINISHED
+    mov byte [hs_buf + 1], 0
+    mov byte [hs_buf + 2], 0
+    mov byte [hs_buf + 3], 12
+    ; copy verify_data from hs_buf+48 to hs_buf+4
+    lea rsi, [hs_buf + 48]
+    lea rdi, [hs_buf + 4]
+    mov rcx, 12
+    cld
+    rep movsb
+
+    ; Restore transcript context (includes CKE)
+    lea rdi, [tls_sha256_ctx]
+    lea rsi, [hs_buf + 2048]
+    mov rcx, 104
+    cld
+    rep movsb
+
+    ; Hash client Finished into transcript
+    lea rdi, [tls_sha256_ctx]
+    lea rsi, [hs_buf]
+    mov edx, 16
+    call sha256_update
+
+    ; Send Finished (encrypted via tls_send)
+    mov rdi, r12
+    mov esi, r13d
+    mov edx, TLS_HANDSHAKE
+    lea rcx, [hs_buf]
+    mov r8d, 16
+    call tls_send
+    test rax, rax
+    js .tcs_error
+
+    ; Finalize transcript → tls_digest (server Finished digest)
+    lea rdi, [tls_sha256_ctx]
+    lea rsi, [tls_digest]
+    call sha256_final
+
+    ; ---- Receive server CCS (plaintext) ----
+    ; Read TLS record header
+    mov edi, r13d
+    lea rsi, [header_buf]
+    mov edx, TLS_HEADER_SIZE
+    call _read_exactly
+    test eax, eax
+    js .tcs_error
+    ; Must be CCS
+    cmp byte [header_buf], TLS_CHANGE_CIPHER_SPEC
+    jne .tcs_error
+    ; Read 1-byte fragment
+    mov edi, r13d
+    lea rsi, [header_buf]
+    mov edx, 1
+    call _read_exactly
+    test eax, eax
+    js .tcs_error
+    cmp byte [header_buf], 1
+    jne .tcs_error
+
+    ; ---- Receive server Finished (encrypted) ----
+    mov rdi, r12
+    mov esi, r13d
+    lea rdx, [rsp + 8]
+    lea rcx, [hs_buf]
+    lea r8, [rsp]
+    call tls_recv
+    test eax, eax
+    jnz .tcs_error
+    ; Must be Handshake
+    cmp byte [rsp + 8], TLS_HANDSHAKE
+    jne .tcs_error
+    ; Must be Finished
+    cmp byte [hs_buf], HS_FINISHED
+    jne .tcs_error
+
+    ; ---- Verify server Finished verify_data ----
+    ; PRF(master_secret, 48, "server finished", label_len, tls_digest, 32, hs_buf+48, 12)
+    lea rdi, [master_secret]
+    mov esi, 48
+    lea rdx, [server_finished_label]
+    mov ecx, server_finished_label_len
+    lea r8, [tls_digest]
+    mov r9d, 32
+    push 12
+    lea rax, [hs_buf + 48]
+    push rax
+    call tls_prf
+    add rsp, 16
+
+    ; Compare expected (hs_buf+48) with received (hs_buf+4)
+    lea rsi, [hs_buf + 48]
+    lea rdi, [hs_buf + 4]
+    mov ecx, 12
+    cld
+    repe cmpsb
     jnz .tcs_error
 
     xor eax, eax
@@ -1266,4 +1494,70 @@ tls_derive_keys:
     pop r12
     pop rbp
     pop rbx
+    ret
+
+; int tls_connect(struct tls_ctx *ctx, int fd,
+;                  const char *hostname, uint64_t hostlen)
+; Initialize TLS context and perform handshake over an already-connected fd.
+; Returns 0 on success, negative on error.
+; rdi = ctx, esi = fd, rdx = hostname, rcx = hostlen
+tls_connect:
+    push r12
+    push r13
+    mov r12, rdi
+    mov r13d, esi
+
+    ; Initialize TLS context
+    mov rdi, r12
+    call tls_init
+
+    ; Run handshake (args already line up: rdi=ctx, esi=fd, rdx=hostname, rcx=hostlen)
+    mov rdi, r12
+    mov esi, r13d
+    call tls_client_start
+    test eax, eax
+    jnz .conn_error
+
+    xor eax, eax
+    jmp .conn_done
+
+.conn_error:
+    or eax, -1
+
+.conn_done:
+    pop r13
+    pop r12
+    ret
+
+; int tls_disconnect(struct tls_ctx *ctx, int fd)
+; Send close_notify alert and close the socket.
+; Returns 0 on success, negative on error.
+; rdi = ctx, esi = fd
+tls_disconnect:
+    push r12
+    push r13
+    sub rsp, 8
+
+    mov r12, rdi
+    mov r13d, esi
+
+    ; Build close_notify alert payload: level=1(warning), desc=0(close_notify)
+    mov word [rsp], 0x0001
+
+    ; Send Alert record
+    mov rdi, r12
+    mov esi, r13d
+    mov edx, TLS_ALERT
+    mov rcx, rsp
+    mov r8, 2
+    call tls_send
+
+    ; Close the socket
+    mov edi, r13d
+    call sys_close
+
+    add rsp, 8
+    xor eax, eax
+    pop r13
+    pop r12
     ret
