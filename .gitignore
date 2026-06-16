@@ -9,3 +9,6 @@
 
 # Keep ASM code
 !**/*.asm
+
+# History
+.gdb_history
