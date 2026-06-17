@@ -18,6 +18,7 @@ TLS_CHANGE_CIPHER_SPEC equ 20
 TLS_ALERT              equ 21
 TLS_HANDSHAKE          equ 22
 TLS_APPLICATION_DATA   equ 23
+MSG_PEEK               equ 2
 
 ; Handshake message types (RFC 5246 §7.4)
 HS_CLIENT_HELLO        equ 1
@@ -122,6 +123,7 @@ tls_init:
     mov [rdi + tls_ctx.write_seq], rax
     mov [rdi + tls_ctx.read_seq], rax
     mov word [rdi + tls_ctx.version], (TLS_VERSION_MAJOR << 8) | TLS_VERSION_MINOR
+    mov byte [rdi + tls_ctx.hs_state], 0
     ret
 
 ; Build MAC input prefix (seq_num + type + version + length)
@@ -170,6 +172,13 @@ _tls_compute_mac:
     mov ecx, ebp
     call _mac_prefix
 
+    ; Copy fragment right after header for contiguous HMAC input
+    lea rdi, [rel mac_header_buf + 13]
+    mov rsi, r15
+    mov rcx, rbp
+    cld
+    rep movsb
+
     ; HMAC-SHA256(mac_key, 32, mac_header_buf || frag, 13 + frag_len, mac_out)
     mov rdi, r12
     mov rsi, 32
@@ -194,6 +203,9 @@ _tls_compute_mac:
 ; rdi = ctx, esi = fd, edx = type, rcx = data, r8 = len
 ; Returns total bytes written (header + data), or negative on error.
 tls_send:
+    ; Save length param immediatly out of r8 
+    mov rax, r8
+
     push rbx
     push rbp
     push r12
@@ -211,8 +223,8 @@ tls_send:
     mov r14d, edx
     ; data
     mov r15, rcx
-    ; save len
-    mov [rsp], r8
+    ; save len securely into our local stack frame allocation slot
+    mov [rsp], rax
 
     cmp r8, TLS_MAX_PAYLOAD
     ja .send_error_too_large
@@ -431,11 +443,10 @@ tls_recv:
     ; set out_type
     mov [r14], al
 
-    ; big-endian length
-    mov ax, [rbx + 3]
-    ror ax, 8
-    ; record fragment length
-    movzx r12d, ax
+    ; Parse big-endian length safely
+    movzx eax, word [rbx + 3]
+    xchg al, ah
+    mov r12d, eax
 
     cmp r12d, TLS_MAX_PAYLOAD + 256
     ja .recv_error_bad_length
@@ -456,9 +467,16 @@ tls_recv:
     mov rax, [rsp]
     mov [rax], r12
 
+    cmp byte [rsp + 8], 20       ; Is this record a ChangeCipherSpec (20)?
+    jne .inc_seq
+    mov qword [rbp + tls_ctx.read_seq], 0 ; Reset sequence number to 0 for upcoming encrypted records!
+    jmp .skip_inc
+.inc_seq:
     add qword [rbp + tls_ctx.read_seq], 1
+.skip_inc:
     xor eax, eax
     jmp .recv_done
+
 
 .recv_encrypted:
     ; --- Encrypted receive ---
@@ -479,6 +497,7 @@ tls_recv:
     lea rdi, [rel record_iv]
     lea rsi, [rel record_plaintext]
     mov rcx, 16
+    xor eax, eax
     cld
     rep movsb
 
@@ -522,8 +541,11 @@ tls_recv:
 .recv_pad_check:
     lea rsi, [rel record_plaintext + 16]
     add rsi, r12
-    add rsi, r10
+
+    movzx r8, r10d
+    add rsi, r8
     dec rsi
+
     movzx ebx, byte [rsi]
     cmp ebx, eax
     jne .recv_error_decrypt
@@ -535,6 +557,7 @@ tls_recv:
     cmp r12d, 32
     jb .recv_error_decrypt
     sub r12d, 32
+    movzx r12, r12d
 
     ; Verify MAC
     ; MAC input: seq_num(8) + type(1) + version(2) + fragment_len(2) + fragment
@@ -547,21 +570,31 @@ tls_recv:
     mov ecx, r12d
     call _mac_prefix
 
+    ; Copy decrypted fragment after mac_header_buf for contiguous HMAC
+    lea rdi, [rel mac_header_buf + 13]
+    lea rsi, [rel record_plaintext + 16]
+    mov rcx, r12
+    cld
+    rep movsb
+
     ; Compute expected MAC
     lea rdi, [rel server_write_mac_key]
     mov rsi, 32
     lea rdx, [rel mac_header_buf]
     mov rcx, 13
     add rcx, r12
-    ; temporary MAC output
     lea r8, [rel prf_outbuf]
     call hmac_sha256
 
     ; Compare computed MAC with received MAC
     lea rsi, [rel prf_outbuf]
     lea rdi, [rel record_plaintext + 16]
-    add rdi, r12                   ; received MAC starts after fragment
+
+    movzx r8, r12d
+    add rdi, r8
+
     mov ecx, 32
+    xor eax, eax
     cld
     repe cmpsb
     jne .recv_error_decrypt
@@ -569,7 +602,7 @@ tls_recv:
     ; Copy decrypted fragment to output
     mov rdi, r15
     lea rsi, [rel record_plaintext + 16]
-    mov rcx, r12
+    movzx rcx, r12d
     cld
     rep movsb
 
@@ -583,10 +616,24 @@ tls_recv:
     jmp .recv_done
 
 .recv_error_bad_length:
+    push 1
+    mov rdi, 2
+    lea rsi, [rsp]
+    mov rdx, 1
+    mov rax, 1
+    syscall
+    add rsp, 8
     mov eax, -3
     jmp .recv_done
 
 .recv_error_decrypt:
+    push 0x44
+    mov rdi, 2
+    lea rsi, [rsp]
+    mov rdx, 1
+    mov rax, 1
+    syscall
+    add rsp, 8
     or eax, -1
     jmp .recv_done
 
@@ -686,8 +733,10 @@ tls_client_start:
     test rax, rax
     js .tcs_error
 
+    mov rbp, rax
+
     ; Hash ClientHello (transcript)
-    mov rdx, rax
+    mov rdx, rbp
     lea rdi, [rel tls_sha256_ctx]
     lea rsi, [rel hs_buf]
     call sha256_update
@@ -697,10 +746,12 @@ tls_client_start:
     mov esi, r13d
     mov edx, TLS_HANDSHAKE
     lea rcx, [rel hs_buf]
-    mov r8, rax
+    mov r8, rbp
     call tls_send
     test rax, rax
     js .tcs_error
+
+
 
     ; --- Main handshake receive loop ---
 .tcs_recv_loop:
@@ -1029,7 +1080,19 @@ tls_client_start:
     lea rsi, [tls_digest]
     call sha256_final
 
-    ; ---- Receive server CCS (plaintext) ----
+    ; ---- Optionally receive server CCS (plaintext) ----
+    ; Some peers may coalesce records and present Finished immediately.
+    ; Peek first byte so we only consume CCS when it is actually present.
+    mov edi, r13d
+    lea rsi, [header_buf]
+    mov edx, 1
+    mov ecx, MSG_PEEK
+    call sys_recv
+    cmp rax, 1
+    jne .tcs_error
+    cmp byte [header_buf], TLS_CHANGE_CIPHER_SPEC
+    jne .tcs_skip_ccs
+
     ; Read TLS record header
     mov edi, r13d
     lea rsi, [header_buf]
@@ -1037,9 +1100,7 @@ tls_client_start:
     call _read_exactly
     test eax, eax
     js .tcs_error
-    ; Must be CCS
-    cmp byte [header_buf], TLS_CHANGE_CIPHER_SPEC
-    jne .tcs_error
+
     ; Read 1-byte fragment
     mov edi, r13d
     lea rsi, [header_buf]
@@ -1049,6 +1110,10 @@ tls_client_start:
     js .tcs_error
     cmp byte [header_buf], 1
     jne .tcs_error
+
+    add qword [r12 + tls_ctx.read_seq], 1
+
+.tcs_skip_ccs:
 
     ; ---- Receive server Finished (encrypted) ----
     mov rdi, r12
@@ -1086,9 +1151,13 @@ tls_client_start:
     mov ecx, 12
     cld
     repe cmpsb
-    jnz .tcs_error
+    jnz .tcs_verify_fail
 
     xor eax, eax
+    jmp .tcs_return
+
+.tcs_verify_fail:
+    mov eax, 255
     jmp .tcs_return
 
 .tcs_error:
@@ -1544,7 +1613,7 @@ tls_disconnect:
     ; Build close_notify alert payload: level=1(warning), desc=0(close_notify)
     mov word [rsp], 0x0001
 
-    ; Send Alert record
+    ; Send Alert record (best-effort, ignore send failures like EPIPE)
     mov rdi, r12
     mov esi, r13d
     mov edx, TLS_ALERT

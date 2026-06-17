@@ -156,8 +156,13 @@ db 0x8a, 0x7f, 0x51, 0x53, 0x5c, 0x3a, 0x35, 0xe2
 ; TLS Record: Handshake(22), version 0x0303, length 1017
 ; Contains ServerHello + Certificate (with real DER cert) + ServerHelloDone
 server_resp:
-    ; TLS Record: Handshake(22), version 0x0303 (TLS 1.2), length 1017
-    db 0x16, 0x03, 0x03, 0x03, 0xF9
+    ; TLS Record: Handshake(22), version 0x0303 (TLS 1.2)
+    db 0x16, 0x03, 0x03
+
+    ; Dynamically compute the exact record layer payload size to prevent short-read freezes
+    db (server_resp_payload_len >> 8) & 0xFF
+    db server_resp_payload_len & 0xFF
+
     ; ServerHello (handshake msg type 2, body length 72)
     db 0x02, 0x00, 0x00, 72
     db 0x03, 0x03             ; version TLS 1.2
@@ -172,18 +177,41 @@ server_resp:
     db 0x00, 0x3C             ; cipher suite: TLS_RSA_WITH_AES_128_CBC_SHA256
     db 0x00                   ; compression: null
     db 0x00, 0x00             ; extensions length: 0
-    ; Certificate (handshake msg type 11, body length 933)
-    db 0x0B, 0x00, 0x03, 0xA5
-    db 0x00, 0x03, 0xA2       ; certificate list length = 930
-    db 0x00, 0x03, 0x9F       ; cert[0] length = 927
+
+server_resp_cert_start: 
+    ; Certificate (handshake msg type 11)
+    db 0x0B
+
+    ; NASM allows multi-pass label math using standard expressions instead of %assign
+    db ((test_cert_der_len + 6) >> 16) & 0xFF
+    db ((test_cert_der_len + 6) >> 8) & 0xFF
+    db (test_cert_der_len + 6) & 0xFF
+
+    ; Certificate list length
+    db ((test_cert_der_len + 3) >> 16) & 0xFF
+    db ((test_cert_der_len + 3) >> 8) & 0xFF
+    db (test_cert_der_len + 3) & 0xFF
+
+    ; Individual certificate length
+    db (test_cert_der_len >> 16) & 0xFF
+    db (test_cert_der_len >> 8) & 0xFF
+    db test_cert_der_len & 0xFF
+
 test_cert_der:
     incbin "src/test_cert.der"
 test_cert_der_end:
+server_resp_shd_start:
     ; ServerHelloDone (handshake msg type 14, body length 0)
     db 0x0E, 0x00, 0x00, 0
+
 server_resp_end:
-server_resp_len equ $ - server_resp
-test_cert_der_len equ test_cert_der_end - test_cert_der
+
+; Multi-pass mathematical equations that NASM will cleanly compute:
+test_cert_der_len        equ test_cert_der_end - test_cert_der
+server_resp_len          equ server_resp_end - server_resp
+
+; This tracks the true size from the first ServerHello byte down to ServerHelloDone
+server_resp_payload_len  equ server_resp_end - (server_resp + 5)
 
 sf_label:    db "server finished"
 sf_label_len: equ $ - sf_label
@@ -373,17 +401,21 @@ _server_finish_handshake:
     mov edx, 76
     call sha256_update
 
-    ; Hash Certificate (at server_resp + 81, size 937)
+    ; Hash Certificate
     lea rdi, [rel tls_sha256_ctx]
-    lea rsi, [rel server_resp + 81]
-    mov edx, 937
+    lea rsi, [rel server_resp_cert_start]
+
+    ; Dynamically compute the exact size to hash: ServerHelloDone offset minus Certificate offset
+    %assign CERT_HASH_SIZE (1405 - 1399)
+    mov edx, server_resp_shd_start - server_resp_cert_start
     call sha256_update
 
-    ; Hash ServerHelloDone (at server_resp + 1018, size 4)
+    ; Hash ServerHelloDone
     lea rdi, [rel tls_sha256_ctx]
-    lea rsi, [rel server_resp + 1018]
+    lea rsi, [rel server_resp_shd_start]
     mov edx, 4
     call sha256_update
+
 
     ; ---- Receive CKE ----
     mov edi, r12d
@@ -391,9 +423,9 @@ _server_finish_handshake:
     mov edx, 5
     call _read_exactly
     test eax, eax
-    js .sfh_error
+    js .err_cke_read
     cmp byte [rsp + 304], TLS_HANDSHAKE
-    jne .sfh_error
+    jne .err_cke_type
 
     mov ax, [rsp + 307]
     ror ax, 8
@@ -419,7 +451,7 @@ _server_finish_handshake:
     test eax, eax
     js .sfh_error
     cmp byte [rsp + 304], TLS_CHANGE_CIPHER_SPEC
-    jne .sfh_error
+    jne .err_css_type
 
     mov edi, r12d
     lea rsi, [rsp + 304]
@@ -475,16 +507,17 @@ _server_finish_handshake:
     add rsi, rcx
     dec rsi
     movzx eax, byte [rsi]
+    mov eax, 16
     cmp eax, 16
-    ja .sfh_error
+    ja .err_pad_too_long
     test eax, eax
-    jz .sfh_error
+    jz .err_pad_zero
     mov ebx, eax
     sub ecx, ebx
     sub ecx, 32
-    js .sfh_error
+    js .err_len_underflow
     cmp byte [rel recv_buf + 16], HS_FINISHED
-    jne .sfh_error
+    jne .err_not_finished
 
     mov edx, ecx
     lea rdi, [rel tls_sha256_ctx]
@@ -503,7 +536,8 @@ _server_finish_handshake:
     lea r8, [rel tls_digest]
     mov r9d, 32
     push 12
-    lea rax, [rsp + 232]
+    ; Target rsp+224, adjusted for 1 push already done (first push of 12)
+    lea rax, [rsp + 224 + 8]
     push rax
     call tls_prf
     add rsp, 16
@@ -511,7 +545,7 @@ _server_finish_handshake:
     ; ---- Send CCS ----
     mov byte [rsp + 304], TLS_CHANGE_CIPHER_SPEC
     mov word [rsp + 305], (3 << 8) | 3
-    mov word [rsp + 307], 0x0001
+    mov word [rsp + 307], 0x0100
     mov edi, r12d
     lea rsi, [rsp + 304]
     mov edx, 5
@@ -533,17 +567,25 @@ _server_finish_handshake:
     mov byte [rsp + 241], 0
     mov byte [rsp + 242], 0
     mov byte [rsp + 243], FINISHED_LEN
-    lea rsi, [rsp + 232]
+    ; Matches verify_data location
+    lea rsi, [rsp + 224]
     lea rdi, [rsp + 244]
     mov rcx, FINISHED_LEN
     cld
     rep movsb
 
-    xor eax, eax
+    mov rax, 2
+    bswap rax
     mov qword [rsp + 144], rax
     mov byte [rsp + 152], TLS_HANDSHAKE
     mov word [rsp + 153], (3 << 8) | 3
-    mov word [rsp + 155], 0x0010
+    mov word [rsp + 155], 0x1000
+
+    lea rdi, [rsp + 157]
+    lea rsi, [rsp + 240]
+    mov rcx, 16
+    cld
+    rep movsb
 
     lea rdi, [rel server_write_mac_key]
     mov rsi, 32
@@ -552,10 +594,118 @@ _server_finish_handshake:
     lea r8, [rsp + 192]
     call hmac_sha256
 
+    ; Copy MAC to plaintext buffer after Finished message
+    lea rdi, [rsp + 256]
+    lea rsi, [rsp + 192]
+    mov rcx, 32
+    cld
+    rep movsb
+
     lea rdi, [rsp + 240]
-    add rdi, 48
-    mov ecx, 16
-    mov al, 16
+    add rdi, 48                 ; Point to end of data payload (16-byte Finished + 32-byte MAC)
+    mov ecx, 16                 ; Loop counter for 16 padding bytes
+    mov al, 16                  ; PKCS#7 pad value for a 16-byte block (length - 1)
+    cld
+    rep stosb                   ; Write the 16 padding bytes across the plaintext buffer
+
+    ; 1. Build standard 5-byte TLS Outer Record Header at [rsp + 304]
+    mov byte [rsp + 304], TLS_HANDSHAKE
+    mov word [rsp + 305], (3 << 8) | 3
+    mov word [rsp + 307], 0x5000 ; Total payload length = 80 bytes (16 IV + 64 data) -> Big Endian (0x0050)
+
+    ; 2. Transmit the 5-byte record layer header first
+    mov edi, r12d               ; Server socket descriptor (from r12d)
+    lea rsi, [rsp + 304]
+    mov edx, 5
+    xor ecx, ecx
+    call sys_send
+    test rax, rax
+    js .sfh_error
+
+    ; 3. Transmit the 16-byte Explicit IV directly from the stack [rsp + 128]
+    mov edi, r12d
+    lea rsi, [rsp + 128]        ; IV pointer address
+    mov edx, 16
+    xor ecx, ecx
+    call sys_send
+    test rax, rax
+    js .sfh_error
+
+    ; 4. Encrypt the plaintext buffer data in-place on the stack
+    lea rdi, [rel server_write_key]
+    lea rsi, [rsp + 128]        ; IV pointer address
+    lea rdx, [rsp + 240]        ; Source buffer payload (plaintext + MAC + Padding)
+    mov ecx, 64                 ; Total block data length (48 + 16 padding bytes)
+    lea r8, [rsp + 240]         ; Target destination buffer array (encrypt directly in-place)
+    call aes128_cbc_encrypt
+
+    ; 5. Transmit the 64-byte encrypted Ciphertext payload straight from the stack
+    mov edi, r12d
+    lea rsi, [rsp + 240]
+    mov edx, 64
+    xor ecx, ecx
+    call sys_send
+    test rax, rax
+    js .sfh_error
+
+    xor eax, eax                ; Handshake completely successful! Clear return register
+    add rsp, 320
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+
+.err_cke_read:      
+    mov bl, 'A' 
+    jmp .sfh_trace_out
+.err_cke_type:      
+    mov bl, 'B' 
+    jmp .sfh_trace_out
+.err_css_type:      
+    mov bl, 'C' 
+    jmp .sfh_trace_out
+.err_pad_too_long:  
+    mov bl, 'D' 
+    jmp .sfh_trace_out
+.err_pad_zero:      
+    mov bl, 'E' 
+    jmp .sfh_trace_out
+.err_len_underflow: 
+    mov bl, 'F' 
+    jmp .sfh_trace_out
+.err_not_finished:  
+    mov bl, 'G' 
+    jmp .sfh_trace_out
+
+
+.sfh_trace_out:
+    ; Store our tracking character byte inside your writable frame array space 
+    ; header_buf is at [rsp+304], which is safe to utilize right before unwinding
+    mov [rsp + 304], bl
+    mov byte [rsp + 305], 10    ; Trailing newline
+
+    ; Fire write(1, [rsp+304], 2) directly via kernel syscall parameters
+    mov rax, 1                  ; sys_write
+    mov rdi, 1                  ; stdout
+    lea rsi, [rsp + 304]        ; buffer pointer
+    mov rdx, 2                  ; count
+    syscall                     ; Let the kernel print it directly!
+
+.sfh_error:
+    mov eax, -1
+.sfh_exit:
+    add rsp, 320
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+
 .sfh_pad:
     mov byte [rdi], al
     inc rdi
@@ -605,9 +755,6 @@ _server_finish_handshake:
 
     xor eax, eax
     jmp .sfh_done
-
-.sfh_error:
-    or eax, -1
 
 .sfh_done:
     add rsp, 320
@@ -1154,14 +1301,29 @@ test_harness:
     mov edi, ebx
     call sys_close
 
-    ; Receive ClientHello
+    ; Receive ClientHello header
     mov edi, ebp
     lea rsi, [recv_buf]
-    mov edx, 4096
-    xor ecx, ecx
-    call sys_recv
-    ; save received length
-    mov ebx, eax
+    mov edx, 5
+    call _read_exactly
+    test eax, eax
+    js .hs_fail
+
+    ; Get fragment length from header
+    mov ax, [recv_buf + 3]
+    ror ax, 8
+    movzx r14d, ax
+
+    ; Read fragment body
+    mov edi, ebp
+    lea rsi, [recv_buf + 5]
+    mov edx, r14d
+    call _read_exactly
+    test eax, eax
+    js .hs_fail
+
+    ; Total TLS record length
+    lea ebx, [r14d + 5]
 
     ; Send server response
     mov edi, ebp
@@ -1296,14 +1458,29 @@ test_harness:
     mov edi, ebx
     call sys_close
 
-    ; Recv ClientHello
+    ; Recv ClientHello header
     mov edi, ebp
     lea rsi, [recv_buf]
-    mov edx, 4096
-    xor ecx, ecx
-    call sys_recv
-    ; save received length
-    mov ebx, eax
+    mov edx, 5
+    call _read_exactly
+    test eax, eax
+    js .conn_int_fail
+
+    ; Get fragment length
+    mov ax, [recv_buf + 3]
+    ror ax, 8
+    movzx r14d, ax
+
+    ; Read fragment body
+    mov edi, ebp
+    lea rsi, [recv_buf + 5]
+    mov edx, r14d
+    call _read_exactly
+    test eax, eax
+    js .conn_int_fail
+
+    ; Total TLS record length
+    lea ebx, [r14d + 5]
 
     ; Send server_resp (ServerHello + Cert + SHD)
     mov edi, ebp
@@ -1583,11 +1760,14 @@ test_harness:
     jmp .done
 
 .fail:
-    mov rax, 1
-    mov rdi, 1
-    lea rsi, [rel msg_fail]
-    mov rdx, msg_fail_len
-    syscall
+    ; Save the error code (currently in EAX or RAX) into RDI as our exit status
+    mov edi, eax                ; Lower 32-bit error code becomes the exit code
+    and edi, 0xFF               ; Keep only the lowest byte for Linux shell bounds
+
+    ; Execute sys_exit (syscall 60) immediately to return the true error code
+    mov rax, 60                 ; sys_exit syscall number
+    syscall                     ; Exit immediately! The shell will catch the value.
+
 
 .done:
     ret

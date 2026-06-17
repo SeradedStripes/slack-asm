@@ -35,6 +35,7 @@ sys_send:
     mov rax, SYS_sendto
     ; syscall expects 4th arg in r10 (not rcx)
     mov r10, rcx
+    or r10, 0x4000          ; MSG_NOSIGNAL — don't die on EPIPE
     xor r8, r8
     xor r9, r9
     syscall
