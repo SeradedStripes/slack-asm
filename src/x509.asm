@@ -113,6 +113,7 @@ _parse_utctime:
     push r9
     push r10
     push r11
+    push r12
     cmp ebx, 13
     jb .pt_err
     call _read_2digit
@@ -126,10 +127,10 @@ _parse_utctime:
     mov edx, eax
     add rdi, 2
     call _read_2digit
-    mov ecx, eax
-    cmp ecx, 1
+    mov r12d, eax
+    cmp r12d, 1
     jb .pt_err
-    cmp ecx, 12
+    cmp r12d, 12
     ja .pt_err
     add rdi, 2
     call _read_2digit
@@ -156,12 +157,14 @@ _parse_utctime:
     add rdi, 2
     cmp byte [rdi], 'Z'
     jne .pt_err
+    mov ecx, r12d
     call _datetime_epoch
     clc
     jmp .pt_done
 .pt_err:
     stc
 .pt_done:
+    pop r12
     pop r11
     pop r10
     pop r9
