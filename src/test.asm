@@ -39,9 +39,18 @@ extern sys_close
   extern server_pubkey_n_len
   extern server_pubkey_e_len
   extern pre_master_sec
-  extern tls_sha256_ctx
-  extern tls_digest
-  extern _read_exactly
+   extern tls_sha256_ctx
+   extern tls_digest
+   extern _read_exactly
+   extern http_start_request
+   extern http_add_header
+   extern http_add_content_length
+   extern http_finish_headers
+   extern http_add_body
+   extern http_parse_response
+   extern http_body_ptr
+   extern http_body_len
+   extern http_status
 
 %define TLS_APPLICATION_DATA 23
 %define HS_DONE 3
@@ -269,6 +278,39 @@ sf_label_len: equ $ - sf_label
 
 msg_pass:     db "all tests passed", 10
 msg_pass_len: equ $ - msg_pass
+
+http_get_method:    db "GET"
+http_get_method_len: equ $ - http_get_method
+http_post_method:   db "POST"
+http_post_method_len: equ $ - http_post_method
+
+http_test_get_path: db "/api/test"
+http_test_get_path_len: equ $ - http_test_get_path
+http_test_post_path: db "/api/chat.postMessage"
+http_test_post_path_len: equ $ - http_test_post_path
+http_test_host_name: db "Host"
+http_test_host_name_len: equ $ - http_test_host_name
+http_test_ct_name:  db "Content-Type"
+http_test_ct_name_len: equ $ - http_test_ct_name
+http_test_host_val: db "slack.com"
+http_test_host_val_len: equ $ - http_test_host_val
+http_test_ct_val:   db "application/json"
+http_test_ct_val_len: equ $ - http_test_ct_val
+
+http_get_req_len:     equ 43
+http_post_req_len:    equ 139
+
+http_test_response:
+db "HTTP/1.1 200 OK", 0x0D, 0x0A
+db "Content-Type: application/json", 0x0D, 0x0A
+db "Content-Length: 12", 0x0D, 0x0A
+db 0x0D, 0x0A
+db '{"status":"ok"}'
+http_test_response_len: equ $ - http_test_response
+
+http_post_body: db '{"channel":"C123","text":"Hi"}'
+http_post_body_len: equ $ - http_post_body
+
 msg_fail:     db "test failed", 10
 msg_fail_len: equ $ - msg_fail
 
@@ -1919,6 +1961,77 @@ test_harness:
     call x509_check_validity
     test eax, eax
     jnz .fail
+
+    ; --- HTTP GET request builder test ---
+    push r12
+
+    lea rdi, [recv_buf]
+    lea rsi, [rel http_get_method]
+    mov edx, http_get_method_len
+    lea rcx, [rel http_test_get_path]
+    mov r8d, http_test_get_path_len
+    call http_start_request
+    mov r12d, eax
+
+    ; Verify "GET" prefix
+    cmp word [recv_buf], 'GE'
+    jne .fail
+    cmp byte [recv_buf + 2], 'T'
+    jne .fail
+
+    lea rdi, [recv_buf + r12]
+    lea rsi, [rel http_test_host_name]
+    mov edx, http_test_host_name_len
+    lea rcx, [rel http_test_host_val]
+    mov r8d, http_test_host_val_len
+    call http_add_header
+    add r12d, eax
+
+    lea rdi, [recv_buf + r12]
+    call http_finish_headers
+    add r12d, eax
+
+    cmp r12d, http_get_req_len
+    jne .fail
+
+    pop r12
+
+    ; --- HTTP response parser test ---
+    lea rdi, [rel http_test_response]
+    mov esi, http_test_response_len
+    call http_parse_response
+    ; dbg: eax value in hex (low byte)
+    push rax
+    mov rax, 1; mov rdi, 1; lea rsi, [rel msg_pass]; mov rdx, 2; syscall
+    pop rax
+    cmp eax, 200
+    jne .fail
+
+    ; dbg: status
+    push rax
+    mov rax, 1; mov rdi, 1; lea rsi, [rel msg_pass]; mov rdx, 1; syscall
+    pop rax
+
+    cmp dword [rel http_status], 200
+    jne .fail
+
+    ; dbg: body_len
+    push rax
+    mov rax, 1; mov rdi, 1; lea rsi, [rel msg_pass]; mov rdx, 1; syscall
+    pop rax
+
+    mov rax, [rel http_body_len]
+    cmp rax, 12
+    jne .fail
+
+    ; dbg: body_ptr
+    push rax
+    mov rax, 1; mov rdi, 1; lea rsi, [rel msg_pass]; mov rdx, 1; syscall
+    pop rax
+
+    mov rsi, [rel http_body_ptr]
+    cmp byte [rsi], '{'
+    jne .fail
 
     mov rax, 1
     mov rdi, 1

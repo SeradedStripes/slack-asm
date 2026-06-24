@@ -21,7 +21,7 @@
 
 ## [ ] Phase 4: HTTP
 - [ ] HTTP/1.1 request serialization (method, path, headers, body).
-- [ ] HTTP response parsing (status line, headers, chunked/Content-Length body).
+- [x] HTTP response parsing (status line, headers, Content-Length body).
 - [ ] Wire it to the TLS layer for `https://slack.com/api/*` calls. (I dont know if that api url is the correct one, but you get the idea)
 
 ## [ ] Phase 5: Slack Integration
