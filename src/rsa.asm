@@ -155,7 +155,9 @@ big_mod:
     mov  r14d, ecx
     mov  r15, rdi
 
+    ; Process windows p[start..start+n-1] for start from n-1 down to 0
     mov  ebx, r14d
+
 .bm_outer:
     dec  ebx
     lea  rdi, [r12 + rbx*8]
@@ -163,6 +165,7 @@ big_mod:
     mov  edx, r14d
     call big_cmp
     js   .bm_no_sub
+
 .bm_sub_loop:
     lea  rdi, [r12 + rbx*8]
     mov  rsi, r13
@@ -173,10 +176,12 @@ big_mod:
     mov  edx, r14d
     call big_cmp
     jns  .bm_sub_loop
+
 .bm_no_sub:
     test ebx, ebx
     jnz  .bm_outer
 
+    ; Final check on bottom nlimbs
     mov  rdi, r12
     mov  rsi, r13
     mov  edx, r14d
@@ -186,6 +191,7 @@ big_mod:
     mov  rsi, r13
     mov  edx, r14d
     call big_sub
+
 .bm_copy:
     mov  rdi, r15
     mov  rsi, r12
@@ -258,7 +264,8 @@ big_mod_pow:
     js   .bmp_done
 
     ; Square: result = result * result mod mod
-    lea  rdi, [rsa_scratch]
+    ; Use rsa_scratch + 3328 as temp to avoid overlapping input/output in big_mul
+    lea  rdi, [rsa_scratch + 3328]
     mov  rsi, r12
     mov  rdx, r12
     mov  ecx, r9d
@@ -267,7 +274,7 @@ big_mod_pow:
     mov  r8, [rsp + 8]
     mov  r9, [rsp]
     mov  rdi, r12
-    lea  rsi, [rsa_scratch]
+    lea  rsi, [rsa_scratch + 3328]
     mov  rdx, r8
     mov  ecx, r9d
     call big_mod
@@ -281,7 +288,7 @@ big_mod_pow:
     jnc  .bmp_main
 
     ; Multiply: result = result * base mod mod
-    lea  rdi, [rsa_scratch]
+    lea  rdi, [rsa_scratch + 3328]
     mov  rsi, r12
     mov  rdx, r13
     mov  ecx, r9d
@@ -290,7 +297,7 @@ big_mod_pow:
     mov  r8, [rsp + 8]
     mov  r9, [rsp]
     mov  rdi, r12
-    lea  rsi, [rsa_scratch]
+    lea  rsi, [rsa_scratch + 3328]
     mov  rdx, r8
     mov  ecx, r9d
     call big_mod

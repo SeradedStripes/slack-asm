@@ -486,13 +486,13 @@ x509_check_validity:
     push r9
     push r10
     push r11
-    mov edx, 2026
-    mov ecx, 6
-    mov r8d, 9
-    mov r9d, 14
-    xor r10d, r10d
-    xor r11d, r11d
-    call _datetime_epoch
+    sub rsp, 16
+    mov edi, 0
+    mov rsi, rsp
+    mov eax, 228
+    syscall
+    mov eax, [rsp]
+    add rsp, 16
     cmp eax, [cert_not_before]
     jb .cv_fail
     cmp eax, [cert_not_after]

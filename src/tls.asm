@@ -75,7 +75,7 @@ server_finished_label_len: equ $ - server_finished_label
 
 section .bss
 header_buf:  resb TLS_HEADER_SIZE
-hs_buf:  resb 4096
+hs_buf:  resb 16384
 prf_seed_buf: resb 512
 prf_abuf:     resb 32
 prf_inbuf:    resb 544
@@ -710,6 +710,9 @@ tls_client_start:
     mov r12, rdi
     ; fd
     mov r13d, esi
+    ; hostname / hostlen (preserve for _build_client_hello)
+    mov r14, rdx
+    mov r15d, ecx
 
     ; Set initial handshake state
     mov byte [r12 + tls_ctx.hs_state], HS_WAIT_SERVER_HELLO
@@ -728,8 +731,10 @@ tls_client_start:
     ; Build ClientHello in hs_buf
     lea rsi, [rel hs_buf]
     mov rdi, r12
+    mov rdx, r14
+    mov ecx, r15d
     call _build_client_hello
-    ; rax = message length (49)
+    ; rax = message length
     test rax, rax
     js .tcs_error
 
@@ -948,24 +953,27 @@ tls_client_start:
     syscall
 .tcs_pms_ok:
 
-    ; ---- RSA-encrypt PMS into CKE body at hs_buf + 4 ----
-    lea rdi, [hs_buf + 4]
+    ; ---- RSA-encrypt PMS into CKE body at hs_buf + 6 ----
+    lea rdi, [hs_buf + 6]
     lea rsi, [pre_master_sec]
     mov edx, 48
     call rsa_pub_encrypt
     test eax, eax
     jnz .tcs_error
 
-    ; Build CKE handshake header (assumes n_len = 256: 00 01 00)
+    ; Build CKE handshake header with 2-byte encrypted PMS length prefix
+    ; Body format: 2-byte length + encrypted data = 2 + 256 = 258 bytes
     mov byte [hs_buf], HS_CLIENT_KEY_EXCHANGE
     mov byte [hs_buf + 1], 0
     mov byte [hs_buf + 2], 1
-    mov byte [hs_buf + 3], 0
+    mov byte [hs_buf + 3], 2
+    ; Encrypted PMS length (big-endian 256 = 0x0100)
+    mov word [hs_buf + 4], 0x0001
 
     ; Hash CKE into transcript
     lea rdi, [tls_sha256_ctx]
     lea rsi, [hs_buf]
-    mov edx, 260
+    mov edx, 262
     call sha256_update
 
     ; Save transcript backup (includes CKE) for server Finished
@@ -980,7 +988,7 @@ tls_client_start:
     mov esi, r13d
     mov edx, TLS_HANDSHAKE
     lea rcx, [hs_buf]
-    mov r8d, 260
+    mov r8d, 262
     call tls_send
     test rax, rax
     js .tcs_error
@@ -1025,6 +1033,8 @@ tls_client_start:
 
     ; Set encryption state (subsequent records are encrypted)
     mov byte [r12 + tls_ctx.hs_state], HS_DONE
+    ; Reset write sequence number to 0 for the new epoch (RFC 5246 §6.1)
+    mov qword [r12 + tls_ctx.write_seq], 0
 
     ; ---- Compute client Finished verify_data ----
     ; PRF(master_secret, 48, "client finished", label_len, tls_digest, 32, hs_buf+48, 12)
@@ -1174,9 +1184,9 @@ tls_client_start:
     ret
 
 
-; Build a ClientHello handshake message (RFC 5246 §7.4.1.2).
-; rdi = ctx, rsi = output buffer
-; Returns total message length in rax (49 bytes).
+; Build a ClientHello handshake message (RFC 5246 §7.4.1.2) with SNI.
+; rdi = ctx, rsi = output buffer, rdx = sni_hostname, rcx = sni_hostlen
+; Returns total message length in rax.
 ; Clobbers only caller-saved registers (rax, rcx, rdx, rdi, rsi, r8-r11).
 _build_client_hello:
     cmp byte [rdi + tls_ctx.hs_state], 0
@@ -1188,17 +1198,16 @@ _build_client_hello:
     push r10
     push r11
 
+    mov r10, rsi                 ; save output buffer pointer
+    mov r11d, ecx                ; sni_hostlen
+
     ; Handshake header
     mov byte [rsi], HS_CLIENT_HELLO
-    ; length hi = 0
-    mov byte [rsi + 1], 0
-    ; length mid = 0
-    mov byte [rsi + 2], 0
-    ; length lo = 45 (body size)
-    mov byte [rsi + 3], 45
+    mov dword [rsi + 1], 0       ; zero length (will fill later)
 
     ; Protocol version: TLS 1.2 (0x0303)
-    mov word [rsi + 4], 0x0303
+    mov byte [rsi + 4], 3
+    mov byte [rsi + 5], 3
 
     ; Client random (32 bytes at ctx offset of 18)
     mov r8, [rdi + tls_ctx.client_random]
@@ -1213,24 +1222,94 @@ _build_client_hello:
     ; Session ID length is 0
     mov byte [rsi + 38], 0
 
-    ; Cipher suites length is 4 (big-endian)
-    mov word [rsi + 39], 0x0004
+    ; Cipher suites length = 4 (big-endian)
+    mov byte [rsi + 39], 0
+    mov byte [rsi + 40], 4
 
     ; Cipher suite 1: TLS_RSA_WITH_AES_128_CBC_SHA256 (0x003C)
-    mov word [rsi + 41], 0x003C
+    mov byte [rsi + 41], 0x00
+    mov byte [rsi + 42], 0x3C
     ; Cipher suite 2: TLS_RSA_WITH_AES_256_CBC_SHA256 (0x003D)
-    mov word [rsi + 43], 0x003D
+    mov byte [rsi + 43], 0x00
+    mov byte [rsi + 44], 0x3D
 
     ; Compression methods length is 1
     mov byte [rsi + 45], 1
     ; Compression method: null (0x00)
     mov byte [rsi + 46], 0
 
-    ; Extensions length is 0
-    mov word [rsi + 47], 0
+    ; Build SNI extension (RFC 6066)
+    ; extensions_len = 32 + hostlen (big-endian; new: renego + ems + sig_algs = 23 bytes)
+    lea r8d, [r11d + 32]
+    mov byte [rsi + 47], 0
+    mov [rsi + 48], r8b
 
-    ; total message length
-    mov eax, 49
+    ; Extension type: server_name (0x0000)
+    mov byte [rsi + 49], 0
+    mov byte [rsi + 50], 0
+
+    ; Extension data length = 5 + hostlen (big-endian)
+    lea r9d, [r11d + 5]
+    mov byte [rsi + 51], 0
+    mov [rsi + 52], r9b
+
+    ; Server name list length = 3 + hostlen (big-endian)
+    lea eax, [r11d + 3]
+    mov byte [rsi + 53], 0
+    mov [rsi + 54], al
+
+    ; Name type: host_name (0x00)
+    mov byte [rsi + 55], 0
+
+    ; Name length = hostlen (big-endian)
+    mov byte [rsi + 56], 0
+    mov [rsi + 57], r11b
+
+    ; Copy hostname at offset 58
+    test r11d, r11d
+    jz .bch_no_sni
+    lea rdi, [rsi + 58]
+    mov rsi, rdx
+    mov rcx, r11
+    rep movsb
+    mov rsi, r10                 ; restore output buffer pointer
+
+.bch_no_sni:
+    ; Write additional mandatory extensions after SNI hostname
+    ; rdi = offset past SNI hostname (= 58 + hostlen)
+    lea rdi, [rsi + 58]
+    add edi, r11d
+
+    ; renegotiation_info (0xff01, RFC 5746)
+    mov word [rdi], 0x01FF
+    mov word [rdi + 2], 0x0100
+    mov byte [rdi + 4], 0
+
+    ; extended_master_secret (0x0023, RFC 7627)
+    mov word [rdi + 5], 0x2300
+    mov word [rdi + 7], 0x0000
+
+    ; signature_algorithms (0x000d, RFC 5246)
+    mov word [rdi + 9], 0x0D00
+    mov word [rdi + 11], 0x0A00
+    mov word [rdi + 13], 0x0800
+    ; SHA-256 + RSA
+    mov word [rdi + 15], 0x0104
+    ; SHA-384 + RSA
+    mov word [rdi + 17], 0x0105
+    ; RSA-PSS + SHA-256
+    mov word [rdi + 19], 0x0408
+    ; SHA-1 + RSA
+    mov word [rdi + 21], 0x0102
+
+    ; body length = 77 + hostlen (3 bytes big-endian)
+    lea eax, [r11d + 77]
+    mov byte [rsi + 1], 0
+    mov byte [rsi + 2], ah
+    mov byte [rsi + 3], al
+
+    ; total message length = 81 + hostlen
+    lea eax, [r11d + 81]
 
 .bch_return:
     pop r11
