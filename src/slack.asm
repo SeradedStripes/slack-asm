@@ -44,6 +44,8 @@ extern http_parse_response
 extern http_body_ptr
 extern http_body_len
 extern http_status
+extern http_chunked
+extern http_decode_chunked
 
 section .rodata
 banner:          db "slack-asm starting...", 10
@@ -253,6 +255,17 @@ https_demo:
     call http_parse_response
     test eax, eax
     js .disconnect
+
+    ; If chunked transfer encoding, decode body in-place
+    cmp byte [rel http_chunked], 0
+    je .no_decode
+    mov rdi, [rel http_body_ptr]
+    mov rsi, [rel http_body_len]
+    call http_decode_chunked
+    test eax, eax
+    js .disconnect
+    mov [rel http_body_len], rax
+.no_decode:
 
     ; Print status code
     lea rsi, [https_ok_msg]

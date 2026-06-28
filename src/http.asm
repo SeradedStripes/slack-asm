@@ -6,6 +6,7 @@ section .bss
 http_body_ptr:  resq 1
 http_body_len:  resq 1
 http_status:    resd 1
+http_chunked:   resb 1
 
 section .text
 global http_start_request
@@ -17,6 +18,8 @@ global http_parse_response
 global http_body_ptr
 global http_body_len
 global http_status
+global http_chunked
+global http_decode_chunked
 
 ; Write decimal uint64 at [rdi], advance rdi past it, return bytes written in rax
 ; rdi = buf, rsi = value. Clobbers: rcx, rdx, rsi, r8
@@ -286,6 +289,7 @@ http_parse_response:
     add eax, ecx
 
     mov [rel http_status], eax
+    mov byte [rel http_chunked], 0
 
     ; Skip status line to find \r\n
     ; Status line is at most ~50 bytes
@@ -326,17 +330,17 @@ http_parse_response:
 
 .hpr_check_content_length:
     cmp dword [rdi], 'Cont'
-    jne .hpr_skip_line
+    jne .hpr_check_transfer_encoding
     cmp dword [rdi + 4], 'ent-'
-    jne .hpr_skip_line
+    jne .hpr_check_transfer_encoding
     cmp dword [rdi + 8], 'Leng'
-    jne .hpr_skip_line
+    jne .hpr_check_transfer_encoding
     cmp byte [rdi + 12], 't'
-    jne .hpr_skip_line
+    jne .hpr_check_transfer_encoding
     cmp byte [rdi + 13], 'h'
-    jne .hpr_skip_line
+    jne .hpr_check_transfer_encoding
     cmp byte [rdi + 14], ':'
-    jne .hpr_skip_line
+    jne .hpr_check_transfer_encoding
 
     lea rsi, [rdi + 15]
 .hpr_cl_skip_ws:
@@ -369,6 +373,46 @@ http_parse_response:
     jmp .hpr_cl_digits
 
 .hpr_cl_done:
+
+.hpr_check_transfer_encoding:
+    cmp dword [rdi], 'Tran'
+    jne .hpr_skip_line
+    cmp dword [rdi + 4], 'sfer'
+    jne .hpr_skip_line
+    cmp byte [rdi + 8], '-'
+    jne .hpr_skip_line
+    cmp dword [rdi + 9], 'Enco'
+    jne .hpr_skip_line
+    cmp dword [rdi + 13], 'ding'
+    jne .hpr_skip_line
+    cmp byte [rdi + 17], ':'
+    jne .hpr_skip_line
+    lea rsi, [rdi + 18]
+.hpr_te_scan:
+    movzx eax, byte [rsi]
+    cmp eax, 0x0D
+    je .hpr_skip_line
+    ; fold case: OR 0x20 for lowercase
+    or eax, 0x20
+    cmp eax, 'c'
+    jne .hpr_te_next
+    cmp byte [rsi + 1], 'h'
+    jne .hpr_te_next
+    cmp byte [rsi + 2], 'u'
+    jne .hpr_te_next
+    cmp byte [rsi + 3], 'n'
+    jne .hpr_te_next
+    cmp byte [rsi + 4], 'k'
+    jne .hpr_te_next
+    cmp byte [rsi + 5], 'e'
+    jne .hpr_te_next
+    cmp byte [rsi + 6], 'd'
+    jne .hpr_te_next
+    mov byte [rel http_chunked], 1
+    jmp .hpr_skip_line
+.hpr_te_next:
+    inc rsi
+    jmp .hpr_te_scan
 
 .hpr_skip_line:
     ; Skip to next line
@@ -434,4 +478,159 @@ http_parse_response:
     pop r12
     pop rbp
     pop rbx
+    ret
+
+
+; Decode chunked transfer encoding in-place.
+; rdi = pointer to raw chunked body, rsi = length of raw body
+; Returns rax = decoded body length. On error, returns -1.
+; The decoded body overwrites the raw body (always <= raw length).
+http_decode_chunked:
+    push r12
+    push r13
+    push r14
+    push r15
+
+    xor eax, eax
+    test rsi, rsi
+    jz .hdc_done
+
+    mov r12, rdi              ; read pointer
+    mov r13, rdi              ; write pointer (same buffer, in-place)
+    mov r14, rsi              ; remaining bytes in raw buffer
+    xor r15d, r15d            ; decoded byte count
+
+.hdc_chunk_loop:
+    test r14, r14
+    jz .hdc_done
+
+    ; Skip optional CRLF before next chunk (after first chunk)
+    cmp byte [r12], 0x0D
+    jne .hdc_parse_size
+    cmp r14, 2
+    jb .hdc_err
+    cmp byte [r12 + 1], 0x0A
+    jne .hdc_err
+    add r12, 2
+    sub r14, 2
+
+.hdc_parse_size:
+    ; Parse hex chunk size
+    xor edx, edx              ; chunk_size
+    xor ecx, ecx              ; digit count
+.hdc_hex_loop:
+    test r14, r14
+    jz .hdc_err
+    movzx eax, byte [r12]
+    cmp eax, 0x0D
+    je .hdc_size_done
+    cmp eax, ';'              ; chunk-extension
+    je .hdc_skip_ext
+    ; Convert hex digit
+    sub eax, '0'
+    cmp eax, 9
+    jbe .hdc_hex_digit
+    ; Try A-F or a-f
+    and eax, 0xDF             ; uppercase
+    sub eax, 7                ; 'A' - '0' - 10 = 7
+    cmp eax, 15
+    ja .hdc_err
+.hdc_hex_digit:
+    shl edx, 4
+    add edx, eax
+    inc r12
+    dec r14
+    inc ecx
+    jmp .hdc_hex_loop
+
+.hdc_skip_ext:
+    ; Skip chunk-extension: advance to CRLF
+    test r14, r14
+    jz .hdc_err
+    cmp byte [r12], 0x0D
+    je .hdc_size_done
+    inc r12
+    dec r14
+    jmp .hdc_skip_ext
+
+.hdc_size_done:
+    ; Skip CRLF after chunk size
+    cmp r14, 2
+    jb .hdc_err
+    cmp word [r12], 0x0A0D
+    jne .hdc_err
+    add r12, 2
+    sub r14, 2
+
+    test edx, edx
+    jz .hdc_last_chunk
+
+    ; Copy chunk data from read ptr to write ptr
+    cmp r14d, edx
+    jb .hdc_err
+    cmp r12, r13
+    jbe .hdc_no_overlap
+    ; If read > write, use memmove
+.hdc_no_overlap:
+    ; Copy chunk data from r12 to r13
+    mov rsi, r12
+    mov rdi, r13
+    mov ecx, edx
+    rep movsb
+    mov r12, rsi
+    mov r13, rdi
+    sub r14, rdx
+    add r15d, edx
+
+    ; Skip CRLF after chunk data
+    cmp r14, 2
+    jb .hdc_err
+    cmp word [r12], 0x0A0D
+    jne .hdc_err
+    add r12, 2
+    sub r14, 2
+
+    jmp .hdc_chunk_loop
+
+.hdc_last_chunk:
+    ; Skip trailers (until final CRLF)
+.hdc_trailer_loop:
+    cmp r14, 2
+    jb .hdc_got_all          ; no more data, we have what we have
+    cmp byte [r12], 0x0D
+    jne .hdc_trailer_line
+    cmp byte [r12 + 1], 0x0A
+    jne .hdc_trailer_line
+    ; Final CRLF, done
+    mov eax, r15d
+    jmp .hdc_done
+.hdc_trailer_line:
+    test r14, r14
+    jz .hdc_got_all
+    cmp byte [r12], 0x0D
+    je .hdc_trailer_crlf
+    inc r12
+    dec r14
+    jmp .hdc_trailer_line
+.hdc_trailer_crlf:
+    cmp r14, 2
+    jb .hdc_err
+    cmp byte [r12 + 1], 0x0A
+    jne .hdc_err
+    add r12, 2
+    sub r14, 2
+    jmp .hdc_trailer_loop
+
+.hdc_got_all:
+    mov eax, r15d
+    jmp .hdc_done
+
+.hdc_err:
+    or eax, -1
+
+.hdc_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
     ret
