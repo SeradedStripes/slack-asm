@@ -63,6 +63,8 @@ extern x509_check_validity
 extern rsa_pub_encrypt
 extern sha256_init, sha256_update, sha256_final
 extern server_pubkey_n_len
+extern debug_putc
+extern debug_hexdump
 
 section .rodata
 master_label:       db "master secret"
@@ -525,41 +527,37 @@ tls_recv:
     ; last byte = pad value
     movzx eax, byte [rsi]
     cmp eax, 16
-    ja .recv_error_decrypt
-    test eax, eax
-    jz .recv_error_decrypt
+    ja .recv_error_pad_range
     cmp eax, r12d
-    ja .recv_error_decrypt
+    ja .recv_error_pad_range
 
-    ; pad_len
+    ; pad_len = padding_length value (may be 0 — OpenSSL legitimate)
     mov ecx, eax
-    ; strip padding AND padding_length byte from length
+    ; strip padding AND trailing padding_length byte
     sub r12d, ecx
     dec r12d
 
     ; Verify padding bytes (PKCS#7)
-    ; save unpadded length
-    mov edx, r12d
-    ; pad_len
+    test ecx, ecx
+    jz .recv_pad_ok          ; no padding array (padding_length=0, OpenSSL)
     mov r10d, ecx
 .recv_pad_check:
     lea rsi, [rel record_plaintext + 16]
     add rsi, r12
-
     movzx r8, r10d
     add rsi, r8
     dec rsi
-
     movzx ebx, byte [rsi]
     cmp ebx, eax
-    jne .recv_error_decrypt
+    jne .recv_error_pad_bad
     dec r10d
     jnz .recv_pad_check
+.recv_pad_ok:
 
-    ; Unpadded length = r12d = old_len - pad_len
+    ; Unpadded length = r12d = old_len -pad_len - 1
     ; Now further strip 32-byte MAC
     cmp r12d, 32
-    jb .recv_error_decrypt
+    jb .recv_error_mac_len
     sub r12d, 32
     movzx r12, r12d
 
@@ -573,6 +571,14 @@ tls_recv:
     ; fragment length (unpadded, without MAC)
     mov ecx, r12d
     call _mac_prefix
+
+    ; Copy decrypted fragment to output BEFORE the MAC buffer copy
+    ; (the MAC buffer copy overlaps record_plaintext and would corrupt it)
+    mov rdi, r15
+    lea rsi, [rel record_plaintext + 16]
+    movzx rcx, r12d
+    cld
+    rep movsb
 
     ; Copy decrypted fragment after mac_header_buf for contiguous HMAC
     lea rdi, [rel mac_header_buf + 13]
@@ -591,27 +597,18 @@ tls_recv:
     call hmac_sha256
 
     ; Compare computed MAC with received MAC
+    ; (received MAC at record_plaintext + 16 + r12 is not corrupted by the copy)
     lea rsi, [rel prf_outbuf]
     lea rdi, [rel record_plaintext + 16]
-
     movzx r8, r12d
     add rdi, r8
-
     mov ecx, 32
     xor eax, eax
     cld
     repe cmpsb
-    jne .recv_error_decrypt
-
-    ; Copy decrypted fragment to output
-    mov rdi, r15
-    lea rsi, [rel record_plaintext + 16]
-    movzx rcx, r12d
-    cld
-    rep movsb
+    jne .recv_error_mac
 
     ; Set out_len
-    ; out_len ptr
     mov rax, [rsp]
     mov [rax], r12
 
@@ -630,14 +627,33 @@ tls_recv:
     mov eax, -3
     jmp .recv_done
 
+.recv_error_pad_range:
+    mov dil, 0x70               ; 'p'
+    call debug_putc
+    or eax, -1
+    jmp .recv_done
+
+.recv_error_pad_bad:
+    mov dil, 0x62               ; 'b'
+    call debug_putc
+    or eax, -1
+    jmp .recv_done
+
+.recv_error_mac_len:
+    mov dil, 0x6c               ; 'l'
+    call debug_putc
+    or eax, -1
+    jmp .recv_done
+
+.recv_error_mac:
+    mov dil, 0x64               ; 'd'
+    call debug_putc
+    or eax, -1
+    jmp .recv_done
+
 .recv_error_decrypt:
-    push 0x44
-    mov rdi, 2
-    lea rsi, [rsp]
-    mov rdx, 1
-    mov rax, 1
-    syscall
-    add rsp, 8
+    mov dil, 0x44               ; 'D' (fallback)
+    call debug_putc
     or eax, -1
     jmp .recv_done
 
@@ -1003,19 +1019,6 @@ tls_client_start:
     mov edx, 48
     call tls_derive_keys
 
-    ; DEBUG: write master_secret to stderr
-    mov eax, 1
-    mov edi, 2
-    lea rsi, [master_secret]
-    mov edx, 48
-    syscall
-    ; DEBUG: write client_write_key to stderr
-    mov eax, 1
-    mov edi, 2
-    lea rsi, [client_write_key]
-    mov edx, 16
-    syscall
-
     ; Validate certificate validity period
     call x509_check_validity
     test eax, eax
@@ -1025,13 +1028,6 @@ tls_client_start:
     lea rdi, [tls_sha256_ctx]
     lea rsi, [tls_digest]
     call sha256_final
-
-    ; DEBUG: write transcript hash to stderr
-    mov eax, 1          ; SYS_write
-    mov edi, 2          ; stderr
-    lea rsi, [tls_digest]
-    mov edx, 32
-    syscall
 
     ; ---- Send ChangeCipherSpec (plaintext) ----
     ; TLS record header
@@ -1128,12 +1124,8 @@ tls_client_start:
     mov [rsp + 16], eax        ; pending_len = 0
 
 .tcs_recv_finished:
-    mov byte [header_buf], 0x4c
-    mov rdi, 2
-    lea rsi, [header_buf]
-    mov rdx, 1
-    mov rax, 1
-    syscall
+    mov dil, 0x4c               ; 'L'
+    call debug_putc
     mov rdi, r12
     mov esi, r13d
     lea rdx, [rsp + 8]
@@ -1142,22 +1134,14 @@ tls_client_start:
     call tls_recv
     test eax, eax
     jnz .tcs_error
-    mov byte [header_buf], 0x2e
-    mov rdi, 2
-    lea rsi, [header_buf]
-    mov rdx, 1
-    mov rax, 1
-    syscall
+    mov dil, 0x2e               ; '.'
+    call debug_putc
     cmp byte [rsp + 8], TLS_HANDSHAKE
     jne .tcs_recv_finished
     cmp byte [hs_buf], HS_FINISHED
     jne .tcs_save_pending      ; save pre-Finished handshake for transcript
-    mov byte [header_buf], 0x46  ; 'F' = got Finished
-    mov rdi, 2
-    lea rsi, [header_buf]
-    mov rdx, 1
-    mov rax, 1
-    syscall
+    mov dil, 0x46               ; 'F'
+    call debug_putc
 
     ; If pre-Finished messages were buffered, replay transcript
     mov eax, [rsp + 16]
@@ -1201,12 +1185,8 @@ tls_client_start:
     cld
     repe cmpsb
     jnz .tcs_verify_fail
-    mov byte [header_buf], 0x50  ; 'P' = verify pass
-    mov rdi, 2
-    lea rsi, [header_buf]
-    mov rdx, 1
-    mov rax, 1
-    syscall
+    mov dil, 0x50               ; 'P'
+    call debug_putc
     xor eax, eax
     jmp .tcs_return
 
@@ -1222,22 +1202,14 @@ tls_client_start:
     jmp .tcs_recv_finished
 
 .tcs_verify_fail:
-    mov byte [header_buf], 0x58  ; 'X' = verify fail
-    mov rdi, 2
-    lea rsi, [header_buf]
-    mov rdx, 1
-    mov rax, 1
-    syscall
+    mov dil, 0x58               ; 'X'
+    call debug_putc
     mov eax, 255
     jmp .tcs_return
 
 .tcs_error:
-    mov byte [header_buf], 0x45  ; 'E' = error
-    mov rdi, 2
-    lea rsi, [header_buf]
-    mov rdx, 1
-    mov rax, 1
-    syscall
+    mov dil, 0x45               ; 'E'
+    call debug_putc
     or eax, -1
 
 .tcs_return:
