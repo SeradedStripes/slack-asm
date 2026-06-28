@@ -50,8 +50,9 @@ struc tls_ctx
     .session_id_len resb 1    ; 114
     .cipher_suite   resw 1    ; 115-116
     .hs_state       resb 1    ; 117
+    .server_ccs     resb 1    ; 118
 endstruc
-tls_ctx_size equ 118
+tls_ctx_size equ 119
 
 extern sys_send, sys_recv, sys_close
 extern hmac_sha256
@@ -124,6 +125,7 @@ tls_init:
     mov [rdi + tls_ctx.read_seq], rax
     mov word [rdi + tls_ctx.version], (TLS_VERSION_MAJOR << 8) | TLS_VERSION_MINOR
     mov byte [rdi + tls_ctx.hs_state], 0
+    mov byte [rdi + tls_ctx.server_ccs], 0
     ret
 
 ; Build MAC input prefix (seq_num + type + version + length)
@@ -298,7 +300,7 @@ tls_send:
     mov ecx, 16
     ; pad_len = 16 - (payload_base % 16)
     sub ecx, edx
-    ; ECX is now 1-16 (PKCS#7 always pads)
+    ; ECX is now 1-16 (total padding overhead including length byte)
     ; save payload_base (frag_len + 32)
     mov [rsp + 8], rbx
     ; rbp = total padded plaintext length
@@ -308,8 +310,8 @@ tls_send:
     ; r8 may have been clobbered by rep movsb / _tls_compute_mac
     mov r8, [rsp]
     lea rdi, [record_plaintext + r8 + 32]
-    ; pad byte value
-    movzx ebx, cl
+    ; pad byte value = padding_length = pad_len - 1
+    lea ebx, [rcx - 1]
     mov rdx, rcx
 .send_pad_loop:
     mov [rdi], bl
@@ -451,8 +453,8 @@ tls_recv:
     cmp r12d, TLS_MAX_PAYLOAD + 256
     ja .recv_error_bad_length
 
-    ; Check if encryption is active
-    cmp byte [rbp + tls_ctx.hs_state], HS_DONE
+    ; Check if server has sent CCS (encryption active on receive)
+    cmp byte [rbp + tls_ctx.server_ccs], 1
     je .recv_encrypted
 
     ; --- Plaintext receive ---
@@ -469,6 +471,7 @@ tls_recv:
 
     cmp byte [rsp + 8], 20       ; Is this record a ChangeCipherSpec (20)?
     jne .inc_seq
+    mov byte [rbp + tls_ctx.server_ccs], 1 ; Server CCS received!
     mov qword [rbp + tls_ctx.read_seq], 0 ; Reset sequence number to 0 for upcoming encrypted records!
     jmp .skip_inc
 .inc_seq:
@@ -530,8 +533,9 @@ tls_recv:
 
     ; pad_len
     mov ecx, eax
-    ; strip padding from length
+    ; strip padding AND padding_length byte from length
     sub r12d, ecx
+    dec r12d
 
     ; Verify padding bytes (PKCS#7)
     ; save unpadded length
@@ -999,6 +1003,19 @@ tls_client_start:
     mov edx, 48
     call tls_derive_keys
 
+    ; DEBUG: write master_secret to stderr
+    mov eax, 1
+    mov edi, 2
+    lea rsi, [master_secret]
+    mov edx, 48
+    syscall
+    ; DEBUG: write client_write_key to stderr
+    mov eax, 1
+    mov edi, 2
+    lea rsi, [client_write_key]
+    mov edx, 16
+    syscall
+
     ; Validate certificate validity period
     call x509_check_validity
     test eax, eax
@@ -1009,11 +1026,20 @@ tls_client_start:
     lea rsi, [tls_digest]
     call sha256_final
 
+    ; DEBUG: write transcript hash to stderr
+    mov eax, 1          ; SYS_write
+    mov edi, 2          ; stderr
+    lea rsi, [tls_digest]
+    mov edx, 32
+    syscall
+
     ; ---- Send ChangeCipherSpec (plaintext) ----
     ; TLS record header
     mov byte [header_buf], TLS_CHANGE_CIPHER_SPEC
     mov word [header_buf + 1], (TLS_VERSION_MAJOR << 8) | TLS_VERSION_MINOR
-    mov word [header_buf + 3], 0x0001
+    mov ax, 0x0001
+    ror ax, 8
+    mov [header_buf + 3], ax
     mov edi, r13d
     lea rsi, [header_buf]
     mov edx, TLS_HEADER_SIZE
@@ -1075,6 +1101,13 @@ tls_client_start:
     mov edx, 16
     call sha256_update
 
+    ; Save SHA-256 context for potential replay with pre-Finished msgs
+    lea rdi, [hs_buf + 2048 + 104]
+    lea rsi, [tls_sha256_ctx]
+    mov rcx, 104
+    cld
+    rep movsb
+
     ; Send Finished (encrypted via tls_send)
     mov rdi, r12
     mov esi, r13d
@@ -1090,42 +1123,17 @@ tls_client_start:
     lea rsi, [tls_digest]
     call sha256_final
 
-    ; ---- Optionally receive server CCS (plaintext) ----
-    ; Some peers may coalesce records and present Finished immediately.
-    ; Peek first byte so we only consume CCS when it is actually present.
-    mov edi, r13d
+    ; Receive server Finished (may be preceded by post-handshake messages)
+    xor eax, eax
+    mov [rsp + 16], eax        ; pending_len = 0
+
+.tcs_recv_finished:
+    mov byte [header_buf], 0x4c
+    mov rdi, 2
     lea rsi, [header_buf]
-    mov edx, 1
-    mov ecx, MSG_PEEK
-    call sys_recv
-    cmp rax, 1
-    jne .tcs_error
-    cmp byte [header_buf], TLS_CHANGE_CIPHER_SPEC
-    jne .tcs_skip_ccs
-
-    ; Read TLS record header
-    mov edi, r13d
-    lea rsi, [header_buf]
-    mov edx, TLS_HEADER_SIZE
-    call _read_exactly
-    test eax, eax
-    js .tcs_error
-
-    ; Read 1-byte fragment
-    mov edi, r13d
-    lea rsi, [header_buf]
-    mov edx, 1
-    call _read_exactly
-    test eax, eax
-    js .tcs_error
-    cmp byte [header_buf], 1
-    jne .tcs_error
-
-    add qword [r12 + tls_ctx.read_seq], 1
-
-.tcs_skip_ccs:
-
-    ; ---- Receive server Finished (encrypted) ----
+    mov rdx, 1
+    mov rax, 1
+    syscall
     mov rdi, r12
     mov esi, r13d
     lea rdx, [rsp + 8]
@@ -1134,12 +1142,43 @@ tls_client_start:
     call tls_recv
     test eax, eax
     jnz .tcs_error
-    ; Must be Handshake
+    mov byte [header_buf], 0x2e
+    mov rdi, 2
+    lea rsi, [header_buf]
+    mov rdx, 1
+    mov rax, 1
+    syscall
     cmp byte [rsp + 8], TLS_HANDSHAKE
-    jne .tcs_error
-    ; Must be Finished
+    jne .tcs_recv_finished
     cmp byte [hs_buf], HS_FINISHED
-    jne .tcs_error
+    jne .tcs_save_pending      ; save pre-Finished handshake for transcript
+    mov byte [header_buf], 0x46  ; 'F' = got Finished
+    mov rdi, 2
+    lea rsi, [header_buf]
+    mov rdx, 1
+    mov rax, 1
+    syscall
+
+    ; If pre-Finished messages were buffered, replay transcript
+    mov eax, [rsp + 16]
+    test eax, eax
+    jz .tcs_skip_replay
+    ; Restore post-client-Finished SHA-256 context
+    lea rdi, [tls_sha256_ctx]
+    lea rsi, [hs_buf + 2048 + 104]
+    mov rcx, 104
+    cld
+    rep movsb
+    ; Hash all buffered pre-Finished handshake messages
+    lea rdi, [tls_sha256_ctx]
+    lea rsi, [hs_buf + 3000]
+    mov edx, [rsp + 16]
+    call sha256_update
+    ; Re-finalize to get correct tls_digest for server Finished
+    lea rdi, [tls_sha256_ctx]
+    lea rsi, [tls_digest]
+    call sha256_final
+.tcs_skip_replay:
 
     ; ---- Verify server Finished verify_data ----
     ; PRF(master_secret, 48, "server finished", label_len, tls_digest, 32, hs_buf+48, 12)
@@ -1162,15 +1201,43 @@ tls_client_start:
     cld
     repe cmpsb
     jnz .tcs_verify_fail
-
+    mov byte [header_buf], 0x50  ; 'P' = verify pass
+    mov rdi, 2
+    lea rsi, [header_buf]
+    mov rdx, 1
+    mov rax, 1
+    syscall
     xor eax, eax
     jmp .tcs_return
 
+.tcs_save_pending:
+    mov r8d, [rsp]
+    lea rdi, [hs_buf + 3000]
+    add rdi, [rsp + 16]
+    lea rsi, [hs_buf]
+    mov ecx, r8d
+    cld
+    rep movsb
+    add [rsp + 16], r8d
+    jmp .tcs_recv_finished
+
 .tcs_verify_fail:
+    mov byte [header_buf], 0x58  ; 'X' = verify fail
+    mov rdi, 2
+    lea rsi, [header_buf]
+    mov rdx, 1
+    mov rax, 1
+    syscall
     mov eax, 255
     jmp .tcs_return
 
 .tcs_error:
+    mov byte [header_buf], 0x45  ; 'E' = error
+    mov rdi, 2
+    lea rsi, [header_buf]
+    mov rdx, 1
+    mov rax, 1
+    syscall
     or eax, -1
 
 .tcs_return:

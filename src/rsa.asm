@@ -49,16 +49,17 @@ big_cmp:
 ; -----------------------------------------------------------------------
 big_sub:
     xor  ecx, ecx
-    clc
+    xor  eax, eax           ; eax = saved borrow (init 0)
 .bs_loop:
-    mov  rax, [rsi + rcx*8]
-    mov  r8,  [rdi + rcx*8]
-    sbb  r8,  rax
-    mov  [rdi + rcx*8], r8
+    mov  r8,  [rsi + rcx*8]
+    mov  r10, [rdi + rcx*8]
+    bt   rax, 0             ; CF = saved borrow (rax is 0 or 1)
+    sbb  r10, r8
+    mov  [rdi + rcx*8], r10
+    setc al                 ; save new borrow
     inc  ecx
     cmp  ecx, edx
     jb   .bs_loop
-    setc al
     ret
 
 ; -----------------------------------------------------------------------
@@ -67,16 +68,17 @@ big_sub:
 ; -----------------------------------------------------------------------
 big_add:
     xor  ecx, ecx
-    clc
+    xor  eax, eax
 .ba_loop:
-    mov  rax, [rsi + rcx*8]
-    mov  r8,  [rdi + rcx*8]
-    adc  r8,  rax
-    mov  [rdi + rcx*8], r8
+    mov  r8,  [rsi + rcx*8]
+    mov  r10, [rdi + rcx*8]
+    bt   rax, 0             ; CF = saved carry
+    adc  r10, r8
+    mov  [rdi + rcx*8], r10
+    setc al
     inc  ecx
     cmp  ecx, edx
     jb   .ba_loop
-    setc al
     ret
 
 ; -----------------------------------------------------------------------
@@ -115,6 +117,7 @@ big_mul:
     xor  r9d, r9d
 .bm_inner:
     mov  r10, [r14 + r9*8]
+    mov  rax, [r13 + rbx*8]
     mul  r10
     lea  r11, [rbx + r9]
     add  rax, [r12 + r11*8]
@@ -139,53 +142,118 @@ big_mul:
     pop  rbx
     ret
 
-; -----------------------------------------------------------------------
-;  big_mod  —  r = p mod n   (p is 2n limbs, clobbered)
-;  rdi = r,  rsi = p,  rdx = n,  ecx = nlimbs
-; -----------------------------------------------------------------------
 big_mod:
     push rbx
+    push rbp
     push r12
     push r13
     push r14
     push r15
+    sub  rsp, 280          ; 264 bytes for q*n product (33 limbs) + padding
 
-    mov  r12, rsi
-    mov  r13, rdx
-    mov  r14d, ecx
-    mov  r15, rdi
-
-    ; Process windows p[start..start+n-1] for start from n-1 down to 0
-    mov  ebx, r14d
+    mov  r12, rsi           ; p (2n limbs, clobbered)
+    mov  r13, rdx           ; n (modulus, n limbs)
+    mov  r14d, ecx          ; nlimbs = n
+    mov  r15, rdi           ; output buffer
+    mov  ebx, r14d          ; start at n-1
+    dec  ebx
 
 .bm_outer:
-    dec  ebx
+    cmp  ebx, 0
+    js   .bm_final
+
+.bm_check_high:
+    ; If p[ebx+n] > 0, multiply and subtract
+    lea  ecx, [rbx + r14]
+    mov  rax, [r12 + rcx*8]
+    test rax, rax
+    jnz  .bm_mul_sub
+
+.bm_check_window:
+    ; If p[ebx..ebx+n-1] >= n, subtract n
     lea  rdi, [r12 + rbx*8]
     mov  rsi, r13
     mov  edx, r14d
     call big_cmp
-    js   .bm_no_sub
+    test eax, eax
+    js   .bm_next
 
-.bm_sub_loop:
     lea  rdi, [r12 + rbx*8]
     mov  rsi, r13
     mov  edx, r14d
     call big_sub
+    test eax, eax
+    jz   .bm_check_window
+    ; Borrow propagated, decrement p[ebx+n] (was 0, becomes all-ones)
+    lea  ecx, [rbx + r14]
+    sub  qword [r12 + rcx*8], 1
+    ; p[ebx+n] is now non-zero; re-check from the top
+    jmp  .bm_check_high
+
+.bm_mul_sub:
+    ; Subtract q * n where q = p[ebx+n]
+    ; Dont clear p[ebx+n] let subtraction handle it
+    mov  rbp, rax           ; rbp = q
+
+    ; Compute q * n into [rsp] (n+1 limbs)
+    xor  r8d, r8d           ; r8 = carry
+    xor  r9d, r9d           ; r9 = i
+.bm_mul:
+    mov  rax, [r13 + r9*8]
+    mul  rbp
+    add  rax, r8
+    adc  rdx, 0
+    mov  [rsp + r9*8], rax
+    mov  r8, rdx
+    inc  r9d
+    cmp  r9d, r14d
+    jb   .bm_mul
+    mov  [rsp + r14*8], r8  ; temp[n] = final carry
+
+    ; Subtract temp[0..n-1] from p[ebx..ebx+n-1]
     lea  rdi, [r12 + rbx*8]
-    mov  rsi, r13
-    mov  edx, r14d
-    call big_cmp
-    jns  .bm_sub_loop
+    xor  ecx, ecx
+    xor  r10d, r10d         ; r10 = saved borrow (init 0)
+.bm_sub:
+    mov  rax, [rsp + rcx*8]
+    mov  r8,  [rdi + rcx*8]
+    bt   r10, 0             ; CF = saved borrow
+    sbb  r8,  rax
+    mov  [rdi + rcx*8], r8
+    setc r10b               ; save new borrow
+    inc  ecx
+    cmp  ecx, r14d
+    jb   .bm_sub
 
-.bm_no_sub:
-    test ebx, ebx
-    jnz  .bm_outer
+    ; p[ebx+n] (temp[n] + borrow)
+    ; Use sbb to avoid overflow when temp[n]=0xFFFFFFFFFFFFFFFF and borrow=1
+    mov  rax, [rsp + r14*8]  ; temp[n]
+    lea  ecx, [rbx + r14]
+    bt   r10, 0              ; CF = borrow (from inner subtract loop)
+    sbb  [r12 + rcx*8], rax  ; p[ebx+n] -= temp[n] + CF
+    jae  .bm_check_high     ; no underflow → check if p[ebx+n] is now 0
 
-    ; Final check on bottom nlimbs
+    ; Cascade borrow upward past p[ebx+n]
+    lea  r8d, [r14*2]
+.bm_cascade:
+    add  ecx, 1
+    cmp  ecx, r8d
+    jae  .bm_check_high     ; hit top of p, borrow is lost (acceptable)
+    sub  qword [r12 + rcx*8], 1
+    jnc  .bm_check_high
+    jmp  .bm_cascade
+
+.bm_next:
+    dec  ebx
+    jmp  .bm_outer
+
+.bm_final:
+    ; Ensure bottom n limbs < n (one more subtraction if needed)
     mov  rdi, r12
     mov  rsi, r13
     mov  edx, r14d
     call big_cmp
+    test eax, eax
     js   .bm_copy
     mov  rdi, r12
     mov  rsi, r13
@@ -200,10 +268,12 @@ big_mod:
     cld
     rep  movsb
 
+    add  rsp, 280
     pop  r15
     pop  r14
     pop  r13
     pop  r12
+    pop  rbp
     pop  rbx
     ret
 
@@ -264,13 +334,11 @@ big_mod_pow:
     js   .bmp_done
 
     ; Square: result = result * result mod mod
-    ; Use rsa_scratch + 3328 as temp to avoid overlapping input/output in big_mul
     lea  rdi, [rsa_scratch + 3328]
     mov  rsi, r12
     mov  rdx, r12
     mov  ecx, r9d
     call big_mul
-    ; big_mul clobbers r8/r9, reload from stack
     mov  r8, [rsp + 8]
     mov  r9, [rsp]
     mov  rdi, r12
@@ -293,7 +361,6 @@ big_mod_pow:
     mov  rdx, r13
     mov  ecx, r9d
     call big_mul
-    ; big_mul clobbers r8/r9, reload from stack
     mov  r8, [rsp + 8]
     mov  r9, [rsp]
     mov  rdi, r12
@@ -360,13 +427,11 @@ pkcs1_v15_encode:
     jmp  .pke_fix
 
 .pke_pad_done:
-    ; write separator at (mod_len - msg_len - 1)
     mov  eax, ebx
     sub  eax, r14d
     dec  eax
     mov  byte [r12 + rax], 0
 
-    ; copy msg to end: dst = out + mod_len - msg_len
     mov  rdi, r12
     add  rdi, rbx
     sub  rdi, r14
@@ -405,7 +470,6 @@ be_to_le:
     cmp  r9d, r14d
     jae  .btl_done
 
-    ; src byte offset = (nlimbs - 1 - i) * 8
     mov  eax, r14d
     dec  eax
     sub  eax, r9d
@@ -445,7 +509,6 @@ le_to_be:
     mov  rax, [r13 + r9*8]
     bswap rax
 
-    ; dst byte offset = (nlimbs - 1 - i) * 8
     mov  ecx, r14d
     dec  ecx
     sub  ecx, r9d
@@ -483,7 +546,6 @@ rsa_pub_encrypt:
     test r15d, r15d
     jz   .rpe_err
 
-    ; PKCS#1 v1.5 pad into rsa_scratch (BE bytes)
     lea  rdi, [rsa_scratch]
     mov  rsi, r13
     mov  edx, r14d
@@ -492,31 +554,25 @@ rsa_pub_encrypt:
     test eax, eax
     jnz  .rpe_err
 
-    ; nlimbs = r15d / 8
     mov  ebp, r15d
     shr  ebp, 3
 
-    ; Convert padded message BE → LE limbs at rsa_scratch + 2048
     lea  rdi, [rsa_scratch + 2048]
     lea  rsi, [rsa_scratch]
     mov  edx, r15d
     call be_to_le
 
-    ; Convert modulus (server_pubkey_n, BE bytes) → LE limbs at rsa_scratch + 3072
     lea  rdi, [rsa_scratch + 3072]
     lea  rsi, [server_pubkey_n]
     mov  edx, r15d
     call be_to_le
 
-    ; Convert exponent to LE limb array at rsa_scratch + 1024
     lea  rdi, [rsa_scratch + 1024]
     xor  eax, eax
     mov  rcx, 256
     cld
     rep  stosb
 
-    ; server_pubkey_e is stored as bytes (e.g. 01 00 01 for 65537)
-    ; LE representation: byte[0] = LSB
     movzx ecx, word [server_pubkey_e_len]
     lea  rsi, [server_pubkey_e]
     lea  rdi, [rsa_scratch + 1024]
@@ -530,16 +586,14 @@ rsa_pub_encrypt:
     jmp  .rpe_exp_cp
 .rpe_exp_done:
 
-    ; big_mod_pow(r, base, exp, explen, mod, modlen)
-    lea  rdi, [rsa_scratch]              ; r: output, 32 limbs
-    lea  rsi, [rsa_scratch + 2048]       ; base: padded message, 32 limbs
-    lea  rdx, [rsa_scratch + 1024]       ; exp: exponent, 32 limbs
-    mov  ecx, ebp                        ; explen = nlimbs
-    lea  r8, [rsa_scratch + 3072]        ; mod: modulus, 32 limbs
-    mov  r9d, ebp                        ; modlen = nlimbs
+    lea  rdi, [rsa_scratch]
+    lea  rsi, [rsa_scratch + 2048]
+    lea  rdx, [rsa_scratch + 1024]
+    mov  ecx, ebp
+    lea  r8, [rsa_scratch + 3072]
+    mov  r9d, ebp
     call big_mod_pow
 
-    ; Convert result (LE limbs at rsa_scratch) to BE bytes at output
     mov  rdi, r12
     lea  rsi, [rsa_scratch]
     mov  edx, r15d

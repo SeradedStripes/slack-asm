@@ -5,7 +5,7 @@ default rel
 
 %define SYS_write  1
 %define SYS_exit   60
-
+%define STDERR     2
 %define STDOUT     1
 %define AF_INET    2
 %define SOCK_STREAM 1
@@ -21,6 +21,11 @@ extern sys_connect
 extern sys_close
 extern make_sockaddr_in
 extern dns_resolve
+extern master_secret
+extern client_write_mac_key
+extern server_write_mac_key
+extern client_write_key
+extern server_write_key
 extern http_start_request
 extern http_add_header
 extern http_finish_headers
@@ -58,7 +63,7 @@ http_get_method_len: equ $ - http_get_method
 
 section .bss
 read_buf:        resb 4096
-tls_ctx_buf:     resb 118
+tls_ctx_buf:     resb 119
 recv_buf:        resb 4096
 recv_type:       resb 1
 recv_len:        resq 1
@@ -76,7 +81,7 @@ _start:
 
 main:
     call print_banner
-    call test_harness
+    ; call test_harness  ; SKIP for debugging
     call https_demo
     xor eax, eax
     ret
@@ -136,6 +141,7 @@ https_demo:
     mov rsi, newline
     mov edx, 1
     call print_str
+    call dump_keys
     jmp .disconnect
 .tls_ok:
 
@@ -229,6 +235,10 @@ https_demo:
 .demo_done:
     pop r12
     pop rbx
+    ret
+
+; Dump derived TLS keys for debugging (placeholder)
+dump_keys:
     ret
 
 ; Print a string (rsi = ptr, edx = len)
