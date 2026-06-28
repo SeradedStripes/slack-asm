@@ -38,17 +38,17 @@ extern http_status
 section .rodata
 banner:          db "slack-asm starting...", 10
 banner_len:      equ $ - banner
-https_ok_msg:    db "HTTPS request OK, status: ", 0
+https_ok_msg:    db "HTTPS request OK, status: "
 https_ok_msg_len: equ $ - https_ok_msg
 https_fail_msg:  db "HTTPS request failed", 10
 https_fail_msg_len: equ $ - https_fail_msg
 dns_fail_msg:    db "DNS resolution failed", 10
 dns_fail_msg_len: equ $ - dns_fail_msg
-tls_fail_msg:    db "TLS fail: ", 0
+tls_fail_msg:    db "TLS fail: "
 tls_fail_msg_len: equ $ - tls_fail_msg
 connect_fail_msg: db "Connection failed", 10
 connect_fail_msg_len: equ $ - connect_fail_msg
-body_msg:        db "Body: ", 0
+body_msg:        db "Body: "
 body_msg_len:    equ $ - body_msg
 newline:         db 10
 
