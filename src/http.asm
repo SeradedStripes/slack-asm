@@ -255,10 +255,10 @@ http_parse_response:
     cmp r13, 15
     jb .hpr_err
 
-    ; Parse "HTTP/1.1 "
+    ; Parse "HTTP/1.x "
     cmp dword [rdi], 'HTTP'
     jne .hpr_err
-    cmp dword [rdi + 4], '/1.1'
+    cmp word [rdi + 4], '/1'
     jne .hpr_err
     cmp byte [rdi + 8], ' '
     jne .hpr_err
