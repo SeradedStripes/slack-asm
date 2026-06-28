@@ -10,6 +10,16 @@ default rel
 %define AF_INET    2
 %define SOCK_STREAM 1
 %define TLS_APPLICATION_DATA 23
+%define RECV_BUF_SIZE  65536
+
+; Target server configuration
+%define HTTPS_HOST     "example.com"
+%define HTTPS_HOST_LEN 11
+%define HTTPS_PORT     443
+; For local test server (openssl s_server), use:
+;   %define HTTPS_HOST     "localhost"
+;   %define HTTPS_HOST_LEN 9
+;   %define HTTPS_PORT     4443
 
 extern test_harness
 extern tls_connect
@@ -54,8 +64,16 @@ newline:         db 10
 
 http_host_name:  db "Host"
 http_host_name_len: equ $ - http_host_name
-http_host_val:   db "localhost"
-http_host_val_len: equ $ - http_host_val
+http_host_val:   db HTTPS_HOST
+http_host_val_len: equ HTTPS_HOST_LEN
+http_ua_name:    db "User-Agent"
+http_ua_name_len: equ $ - http_ua_name
+http_ua_val:     db "slack-asm/0.1"
+http_ua_val_len: equ $ - http_ua_val
+http_conn_name:  db "Connection"
+http_conn_name_len: equ $ - http_conn_name
+http_conn_val:   db "close"
+http_conn_val_len: equ $ - http_conn_val
 http_get_path:   db "/"
 http_get_path_len: equ $ - http_get_path
 http_get_method: db "GET"
@@ -64,7 +82,7 @@ http_get_method_len: equ $ - http_get_method
 section .bss
 read_buf:        resb 4096
 tls_ctx_buf:     resb 119
-recv_buf:        resb 4096
+recv_buf:        resb RECV_BUF_SIZE
 recv_type:       resb 1
 recv_len:        resq 1
 sockaddr:        resb 16
@@ -94,13 +112,24 @@ print_banner:
     syscall
     ret
 
-; Demo an HTTPS GET request to www.example.com:443
+; Demo an HTTPS GET request
 https_demo:
     push rbx
     push r12
+    push r13
+    push r14
+    push r15
 
-    ; Skip DNS, use hardcoded localhost 127.0.0.1:4443
-    mov r12d, 0x7f000001          ; 127.0.0.1 in host byte order
+    ; Resolve hostname to IP via DNS (or use fallback)
+    lea rdi, [http_host_val]
+    mov esi, http_host_val_len
+    call dns_resolve
+    mov r15d, eax
+    test r15d, r15d
+    jnz .have_ip
+    ; DNS failed — try localhost 127.0.0.1 as fallback
+    mov r15d, 0x7f000001
+.have_ip:
 
     ; Create TCP socket
     mov edi, AF_INET
@@ -113,8 +142,8 @@ https_demo:
 
     ; Connect to target
     lea rdi, [sockaddr]
-    mov esi, 4443                 ; port
-    mov edx, r12d                 ; IP
+    mov esi, HTTPS_PORT
+    mov edx, r15d                 ; IP
     call make_sockaddr_in
 
     mov edi, ebx
@@ -163,6 +192,22 @@ https_demo:
     add r12d, eax
 
     lea rdi, [read_buf + r12]
+    lea rsi, [http_conn_name]
+    mov edx, http_conn_name_len
+    lea rcx, [http_conn_val]
+    mov r8d, http_conn_val_len
+    call http_add_header
+    add r12d, eax
+
+    lea rdi, [read_buf + r12]
+    lea rsi, [http_ua_name]
+    mov edx, http_ua_name_len
+    lea rcx, [http_ua_val]
+    mov r8d, http_ua_val_len
+    call http_add_header
+    add r12d, eax
+
+    lea rdi, [read_buf + r12]
     call http_finish_headers
     add r12d, eax
 
@@ -176,19 +221,35 @@ https_demo:
     test rax, rax
     js .disconnect
 
-    ; Receive response
+    ; Receive full HTTP response across multiple TLS records
+    xor r14d, r14d                ; total bytes accumulated
+.recv_loop:
     lea rdi, [tls_ctx_buf]
     mov esi, ebx
     lea rdx, [recv_type]
-    lea rcx, [recv_buf]
+    lea rcx, [recv_buf + r14]
     lea r8, [recv_len]
     call tls_recv
     test eax, eax
     jnz .disconnect
+    cmp byte [recv_type], TLS_APPLICATION_DATA
+    jne .recv_done
+    mov eax, [recv_len]
+    test eax, eax
+    jz .recv_done
+    add r14d, eax
+    ; Check remaining buffer space (need room for at least one more record)
+    cmp r14d, RECV_BUF_SIZE - 16384
+    jb .recv_loop
+.recv_done:
 
-    ; Parse HTTP response
+    ; Check we received something
+    test r14d, r14d
+    jz .disconnect
+
+    ; Parse HTTP response from accumulated buffer
     lea rdi, [recv_buf]
-    mov rsi, [recv_len]
+    mov rsi, r14
     call http_parse_response
     test eax, eax
     js .disconnect
@@ -233,6 +294,9 @@ https_demo:
     call sys_close
 
 .demo_done:
+    pop r15
+    pop r14
+    pop r13
     pop r12
     pop rbx
     ret
