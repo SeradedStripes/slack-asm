@@ -16,3 +16,5 @@ repomix-output.xml
 
 # Test stuff
 **/*.pem
+**/*.crt
+**/*.key
