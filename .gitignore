@@ -6,6 +6,8 @@
 
 # Build Binaries
 **/slack
+**/gcm_test
+**/rsa_test
 
 # Keep ASM code
 !**/*.asm
