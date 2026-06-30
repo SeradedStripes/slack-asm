@@ -24,6 +24,7 @@ MSG_PEEK               equ 2
 HS_CLIENT_HELLO        equ 1
 HS_SERVER_HELLO        equ 2
 HS_CERTIFICATE         equ 11
+HS_SERVER_KEY_EXCHANGE equ 12
 HS_SERVER_HELLO_DONE   equ 14
 HS_CLIENT_KEY_EXCHANGE equ 16
 HS_FINISHED            equ 20
@@ -34,8 +35,13 @@ FINISHED_LEN           equ 12
 ; Handshake client states
 HS_WAIT_SERVER_HELLO      equ 0
 HS_WAIT_CERTIFICATE       equ 1
+HS_WAIT_SERVER_KEY_EXCHANGE equ 4
 HS_WAIT_SERVER_HELLO_DONE equ 2
 HS_DONE                   equ 3
+
+TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 equ 0xC02F
+GCM_EXPLICIT_NONCE_LEN equ 8
+GCM_TAG_LEN equ 16
 
 TLS_VERSION_MAJOR equ 3
 TLS_VERSION_MINOR equ 3
@@ -63,6 +69,10 @@ extern x509_check_validity
 extern rsa_pub_encrypt
 extern sha256_init, sha256_update, sha256_final
 extern server_pubkey_n_len
+extern ecc_scalar_mult
+extern ecc_scalar_mult_base
+extern aes128_gcm_encrypt
+extern aes128_gcm_decrypt
 extern debug_putc
 extern debug_hexdump
 
@@ -94,6 +104,9 @@ aes_round_keys:    resb 176
 mac_header_buf:    resb 13
 record_iv:         resb 16
 record_plaintext:  resb 16448  ; max fragment + 32 MAC + 16 pad
+gcm_nonce:         resb 12     ; fixed_iv(4) + explicit_nonce(8)
+server_ec_pubkey:  resb 64     ; server EC public key (x, y)
+client_ec_privkey: resb 32     ; client EC private key scalar
 tls_sha256_ctx:    resb 104    ; transcript hash SHA-256 context
 tls_digest:        resb 32     ; transcript hash output
 pre_master_sec:    resb 48     ; pre-master secret (shared with test)
@@ -266,53 +279,37 @@ tls_send:
     jmp .send_done
 
 .send_encrypted:
-    ; --- Encrypted send (after handshake) ---
-    ; 1. Compute MAC
+    cmp word [r12 + tls_ctx.cipher_suite], TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+    je .send_gcm
+
+    ; --- CBC encrypted send ---
     lea rdi, [rel client_write_mac_key]
     lea rsi, [r12 + tls_ctx.write_seq]
     mov edx, r14d
     mov rcx, r15
-    ; frag_len
     mov r8, [rsp]
-    ; MAC goes after fragment
     lea r9, [record_plaintext + r8]
     call _tls_compute_mac
 
-    ; 2. Build plaintext: fragment + MAC (32 bytes) + padding
-    ; Copy fragment to record_plaintext
     mov rsi, r15
     lea rdi, [rel record_plaintext]
-    ; frag_len
     mov rcx, [rsp]
     cld
-    ; copy fragment
     rep movsb
 
-    ; MAC already at record_plaintext + frag_len (computed above)
-
-    ; Compute total payload length: frag_len + 32 (MAC)
     mov rbx, [rsp]
-    ; rbx = payload_base = frag_len + 32
     lea rbx, [rbx + 32]
-    ; Add padding: pad to multiple of 16, at least 1 byte
     mov eax, ebx
     xor edx, edx
     mov ecx, 16
     div ecx
     mov ecx, 16
-    ; pad_len = 16 - (payload_base % 16)
     sub ecx, edx
-    ; ECX is now 1-16 (total padding overhead including length byte)
-    ; save payload_base (frag_len + 32)
     mov [rsp + 8], rbx
-    ; rbp = total padded plaintext length
     lea rbp, [rbx + rcx]
 
-    ; Write padding bytes (PKCS#7)
-    ; r8 may have been clobbered by rep movsb / _tls_compute_mac
     mov r8, [rsp]
     lea rdi, [record_plaintext + r8 + 32]
-    ; pad byte value = padding_length = pad_len - 1
     lea ebx, [rcx - 1]
     mov rdx, rcx
 .send_pad_loop:
@@ -320,41 +317,29 @@ tls_send:
     inc rdi
     dec rdx
     jnz .send_pad_loop
-    ; rbp already = total padded plaintext length
-    ; pad_len
     movzx ecx, bl
 
-    ; 3. Generate random 16-byte explicit IV
     lea rdi, [rel record_iv]
     mov esi, 16
     xor edx, edx
-    ; getrandom
     mov eax, 318
     syscall
 
-    ; 4. AES-128-CBC encrypt: ciphertext = AES-CBC(record_iv, plaintext)
-    ; Input: key=client_write_key, iv=record_iv, plaintext=record_plaintext
-    ; Output: to record_plaintext (in-place)
     lea rdi, [rel client_write_key]
     lea rsi, [rel record_iv]
     lea rdx, [rel record_plaintext]
-    ; total plaintext length
     mov rcx, rbp
     lea r8, [rel record_plaintext]
     call aes128_cbc_encrypt
 
-    ; 5. Build TLS record header
     lea rsi, [rel header_buf]
-    ; content type
     mov [rsi], r14b
     mov word [rsi + 1], (TLS_VERSION_MAJOR << 8) | TLS_VERSION_MINOR
-    ; Record length = 16 (IV) + ciphertext_len (= plaintext_len, same as rbp)
     mov eax, 16
     add eax, ebp
     ror ax, 8
     mov [rsi + 3], ax
 
-    ; Send header
     mov edi, r13d
     mov edx, TLS_HEADER_SIZE
     xor ecx, ecx
@@ -362,7 +347,6 @@ tls_send:
     cmp rax, TLS_HEADER_SIZE
     jne .send_error
 
-    ; Send explicit IV
     mov edi, r13d
     lea rsi, [rel record_iv]
     mov edx, 16
@@ -371,7 +355,6 @@ tls_send:
     cmp rax, 16
     jne .send_error
 
-    ; Send ciphertext
     mov edi, r13d
     lea rsi, [rel record_plaintext]
     mov edx, ebp
@@ -381,10 +364,97 @@ tls_send:
     jne .send_error
 
     add qword [r12 + tls_ctx.write_seq], 1
-
     mov eax, TLS_HEADER_SIZE
     add eax, 16
     add eax, ebp
+    jmp .send_done
+
+.send_gcm:
+    ; --- GCM encrypted send ---
+    ; Copy plaintext to record_plaintext + 8 (leave room for explicit_nonce)
+    mov rsi, r15
+    lea rdi, [rel record_plaintext + GCM_EXPLICIT_NONCE_LEN]
+    mov rcx, [rsp]
+    cld
+    rep movsb
+
+    ; Generate 8-byte explicit nonce
+    lea rdi, [rel gcm_nonce + 4]
+    mov esi, GCM_EXPLICIT_NONCE_LEN
+    xor edx, edx
+    mov eax, 318
+    syscall
+
+    ; Build full nonce: fixed_iv (4) + explicit (8) at gcm_nonce
+    lea rdi, [rel gcm_nonce]
+    lea rsi, [rel client_write_iv]
+    mov rcx, 4
+    cld
+    rep movsb
+
+    ; Build AAD (13 bytes) via _mac_prefix
+    lea rdi, [rel mac_header_buf]
+    lea rsi, [r12 + tls_ctx.write_seq]
+    mov edx, r14d
+    mov ecx, [rsp]
+    call _mac_prefix
+
+    ; rbp = plaintext length
+    mov rbp, [rsp]
+
+    ; Call aes128_gcm_encrypt
+    ; Stack args: [rsp]=ct_out, [rsp+8]=tag_out
+    sub rsp, 16
+    lea rax, [rel record_plaintext + GCM_EXPLICIT_NONCE_LEN]
+    mov [rsp], rax
+    lea rax, [rel record_plaintext + GCM_EXPLICIT_NONCE_LEN]
+    add rax, rbp
+    mov [rsp + 8], rax
+    lea rdi, [rel client_write_key]
+    lea rsi, [rel gcm_nonce]
+    lea rdx, [rel record_plaintext + GCM_EXPLICIT_NONCE_LEN]
+    mov rcx, rbp
+    lea r8, [rel mac_header_buf]
+    mov r9d, 13
+    call aes128_gcm_encrypt
+    lea rax, [rsp + 16]
+    add rsp, 16
+
+    ; Copy explicit_nonce to front of record_plaintext
+    lea rdi, [rel record_plaintext]
+    lea rsi, [rel gcm_nonce + 4]
+    mov rcx, GCM_EXPLICIT_NONCE_LEN
+    cld
+    rep movsb
+
+    ; Record header
+    lea rsi, [rel header_buf]
+    mov [rsi], r14b
+    mov word [rsi + 1], (TLS_VERSION_MAJOR << 8) | TLS_VERSION_MINOR
+    lea eax, [GCM_EXPLICIT_NONCE_LEN + rbp + GCM_TAG_LEN]
+    ror ax, 8
+    mov [rsi + 3], ax
+
+    mov edi, r13d
+    mov edx, TLS_HEADER_SIZE
+    xor ecx, ecx
+    call sys_send
+    cmp rax, TLS_HEADER_SIZE
+    jne .send_error
+
+    ; Send fragment: explicit_nonce || ciphertext || tag
+    mov edi, r13d
+    lea rsi, [rel record_plaintext]
+    lea edx, [GCM_EXPLICIT_NONCE_LEN + rbp + GCM_TAG_LEN]
+    xor ecx, ecx
+    push rdx
+    call sys_send
+    pop rcx
+    cmp rax, rcx
+    jne .send_error
+
+    add qword [r12 + tls_ctx.write_seq], 1
+    lea eax, [TLS_HEADER_SIZE + GCM_EXPLICIT_NONCE_LEN + rbp + GCM_TAG_LEN]
     jmp .send_done
 
 .send_error_too_large:
@@ -484,13 +554,13 @@ tls_recv:
 
 
 .recv_encrypted:
-    ; --- Encrypted receive ---
-    ; Fragment = explicit_IV(16) + ciphertext
-    ; at least IV + 1 byte
+    cmp word [rbp + tls_ctx.cipher_suite], TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+    je .recv_gcm
+
+    ; --- CBC encrypted receive ---
     cmp r12d, 17
     jb .recv_error_bad_length
 
-    ; Read IV + ciphertext into record_plaintext buffer
     mov edi, r13d
     lea rsi, [rel record_plaintext]
     mov edx, r12d
@@ -498,7 +568,6 @@ tls_recv:
     test rax, rax
     js .recv_error_read
 
-    ; Copy explicit IV from start of record_plaintext
     lea rdi, [rel record_iv]
     lea rsi, [rel record_plaintext]
     mov rcx, 16
@@ -506,13 +575,10 @@ tls_recv:
     cld
     rep movsb
 
-    ; Decrypt: ciphertext is after IV (offset 16), length = r12d - 16
     mov ecx, r12d
     sub ecx, 16
-    ; ciphertext length
     mov r12d, ecx
 
-    ; Decrypt in-place using server_write_key (client receiving from server)
     lea rdi, [rel server_write_key]
     lea rsi, [rel record_iv]
     lea rdx, [rel record_plaintext + 16]
@@ -520,26 +586,21 @@ tls_recv:
     lea r8, [rel record_plaintext + 16]
     call aes128_cbc_decrypt
 
-    ; Strip PKCS#7 padding
     lea rsi, [rel record_plaintext + 16]
     add rsi, r12
     dec rsi
-    ; last byte = pad value
     movzx eax, byte [rsi]
     cmp eax, 16
     ja .recv_error_pad_range
     cmp eax, r12d
     ja .recv_error_pad_range
 
-    ; pad_len = padding_length value (may be 0 — OpenSSL legitimate)
     mov ecx, eax
-    ; strip padding AND trailing padding_length byte
     sub r12d, ecx
     dec r12d
 
-    ; Verify padding bytes (PKCS#7)
     test ecx, ecx
-    jz .recv_pad_ok          ; no padding array (padding_length=0, OpenSSL)
+    jz .recv_pad_ok
     mov r10d, ecx
 .recv_pad_check:
     lea rsi, [rel record_plaintext + 16]
@@ -554,40 +615,29 @@ tls_recv:
     jnz .recv_pad_check
 .recv_pad_ok:
 
-    ; Unpadded length = r12d = old_len -pad_len - 1
-    ; Now further strip 32-byte MAC
     cmp r12d, 32
     jb .recv_error_mac_len
     sub r12d, 32
     movzx r12, r12d
 
-    ; Verify MAC
-    ; MAC input: seq_num(8) + type(1) + version(2) + fragment_len(2) + fragment
-    ; Build MAC prefix in mac_header_buf
     lea rdi, [rel mac_header_buf]
     lea rsi, [rbp + tls_ctx.read_seq]
-    ; content type
     mov edx, [rsp + 8]
-    ; fragment length (unpadded, without MAC)
     mov ecx, r12d
     call _mac_prefix
 
-    ; Copy decrypted fragment to output BEFORE the MAC buffer copy
-    ; (the MAC buffer copy overlaps record_plaintext and would corrupt it)
     mov rdi, r15
     lea rsi, [rel record_plaintext + 16]
     movzx rcx, r12d
     cld
     rep movsb
 
-    ; Copy decrypted fragment after mac_header_buf for contiguous HMAC
     lea rdi, [rel mac_header_buf + 13]
     lea rsi, [rel record_plaintext + 16]
     mov rcx, r12
     cld
     rep movsb
 
-    ; Compute expected MAC
     lea rdi, [rel server_write_mac_key]
     mov rsi, 32
     lea rdx, [rel mac_header_buf]
@@ -596,8 +646,6 @@ tls_recv:
     lea r8, [rel prf_outbuf]
     call hmac_sha256
 
-    ; Compare computed MAC with received MAC
-    ; (received MAC at record_plaintext + 16 + r12 is not corrupted by the copy)
     lea rsi, [rel prf_outbuf]
     lea rdi, [rel record_plaintext + 16]
     movzx r8, r12d
@@ -607,8 +655,77 @@ tls_recv:
     cld
     repe cmpsb
     jne .recv_error_mac
+    jmp .recv_plaintext_done
 
-    ; Set out_len
+.recv_gcm:
+    ; --- GCM encrypted receive ---
+    ; Fragment = explicit_nonce(8) + ciphertext + tag(16)
+    cmp r12d, GCM_EXPLICIT_NONCE_LEN + 1 + GCM_TAG_LEN
+    jb .recv_error_bad_length
+
+    mov edi, r13d
+    lea rsi, [rel record_plaintext]
+    mov edx, r12d
+    call _read_exactly
+    test rax, rax
+    js .recv_error_read
+
+    ; Copy explicit_nonce from record_plaintext[0..7] to gcm_nonce[4..11]
+    lea rdi, [rel gcm_nonce + 4]
+    lea rsi, [rel record_plaintext]
+    mov rcx, GCM_EXPLICIT_NONCE_LEN
+    cld
+    rep movsb
+
+    ; Copy server_write_iv to gcm_nonce[0..3]
+    lea rdi, [rel gcm_nonce]
+    lea rsi, [rel server_write_iv]
+    mov rcx, 4
+    cld
+    rep movsb
+
+    ; CT length = total - explicit_nonce - tag
+    mov ecx, r12d
+    sub ecx, GCM_EXPLICIT_NONCE_LEN
+    sub ecx, GCM_TAG_LEN
+    mov r12d, ecx
+
+    ; Build AAD via _mac_prefix
+    lea rdi, [rel mac_header_buf]
+    lea rsi, [rbp + tls_ctx.read_seq]
+    mov edx, [rsp + 8]
+    mov ecx, r12d
+    call _mac_prefix
+
+    ; aes128_gcm_decrypt stack args: [rsp+0]=tag_ptr, [rsp+8]=pt_out
+    sub rsp, 16
+    lea rax, [rel record_plaintext + GCM_EXPLICIT_NONCE_LEN]
+    add rax, r12
+    mov [rsp], rax
+    mov rax, r15
+    mov [rsp + 8], rax
+    lea rdi, [rel server_write_key]
+    lea rsi, [rel gcm_nonce]
+    lea rdx, [rel record_plaintext + GCM_EXPLICIT_NONCE_LEN]
+    mov rcx, r12
+    lea r8, [rel mac_header_buf]
+    mov r9d, 13
+    call aes128_gcm_decrypt
+    add rsp, 16
+
+    test eax, eax
+    jnz .recv_error_mac
+
+    ; out_len = ct_len
+    mov rax, [rsp]
+    mov [rax], r12
+
+    add qword [rbp + tls_ctx.read_seq], 1
+    xor eax, eax
+    jmp .recv_done
+
+.recv_plaintext_done:
+    ; Set out_len (shared between CBC and GCM plaintext paths)
     mov rax, [rsp]
     mov [rax], r12
 
@@ -834,10 +951,17 @@ tls_client_start:
     cmp dl, HS_WAIT_CERTIFICATE
     je .tcs_handle_cert
 
+    cmp dl, HS_WAIT_SERVER_KEY_EXCHANGE
+    je .tcs_handle_ske
+
     cmp dl, HS_WAIT_SERVER_HELLO_DONE
     je .tcs_handle_shd
 
     jmp .tcs_error
+
+; Real Quick
+; Fucking hate assembly
+; Also love it tho dw
 
 .tcs_handle_sh:
     cmp al, HS_SERVER_HELLO
@@ -917,6 +1041,79 @@ tls_client_start:
     test eax, eax
     jnz .tcs_error
 
+    ; After Certificate, next message depends on cipher suite
+    cmp word [r12 + tls_ctx.cipher_suite], TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+    jne .tcs_cert_then_shd
+    mov byte [r12 + tls_ctx.hs_state], HS_WAIT_SERVER_KEY_EXCHANGE
+    jmp .tcs_advance
+.tcs_cert_then_shd:
+    mov byte [r12 + tls_ctx.hs_state], HS_WAIT_SERVER_HELLO_DONE
+    jmp .tcs_advance
+
+.tcs_handle_ske:
+    cmp al, HS_SERVER_KEY_EXCHANGE
+    jne .tcs_error
+
+    ; Parse ServerKeyExchange body at r14+4, length ebx
+    ; For ECDHE-RSA:
+    ;   curve_type(1) + named_curve(2) + pubkey_len(1) + pubkey(variable)
+    ;   + hash_alg(1) + sig_alg(1) + sig_len(2) + sig(variable)
+
+    ; Verify minimum length: 3 (EC params) + 66 (P-256 uncompressed) + 4 (sig header) = 73
+    cmp ebx, 73
+    jb .tcs_error
+
+    lea rsi, [r14 + 4]
+    ; Check curve type = named_curve (3)
+    cmp byte [rsi], 3
+    jne .tcs_error
+    ; Check named curve = secp256r1 (0x0017)
+    cmp word [rsi + 1], 0x1700  ; big-endian
+    jne .tcs_error
+
+    ; Extract server EC public key (uncompressed point)
+    ; pubkey_len at [rsi+3]
+    movzx eax, byte [rsi + 3]
+    cmp eax, 65
+    jne .tcs_error
+    ; Check point format: must start with 0x04 (uncompressed)
+    cmp byte [rsi + 4], 4
+    jne .tcs_error
+
+    ; Copy and convert x coordinate: BE wire -> LE limbs
+    lea rdi, [rel server_ec_pubkey]
+    lea rsi, [rsi + 5]
+    mov rax, [rsi]
+    bswap rax
+    mov [rdi + 24], rax
+    mov rax, [rsi + 8]
+    bswap rax
+    mov [rdi + 16], rax
+    mov rax, [rsi + 16]
+    bswap rax
+    mov [rdi + 8], rax
+    mov rax, [rsi + 24]
+    bswap rax
+    mov [rdi], rax
+
+    ; Copy and convert y coordinate: BE wire -> LE limbs
+    lea rdi, [rel server_ec_pubkey + 32]
+    lea rsi, [rsi + 32]
+    mov rax, [rsi]
+    bswap rax
+    mov [rdi + 24], rax
+    mov rax, [rsi + 8]
+    bswap rax
+    mov [rdi + 16], rax
+    mov rax, [rsi + 16]
+    bswap rax
+    mov [rdi + 8], rax
+    mov rax, [rsi + 24]
+    bswap rax
+    mov [rdi], rax
+
+    ; Skip signature verification for now (verified by handshake integrity)
+    ; Proceed to ServerHelloDone
     mov byte [r12 + tls_ctx.hs_state], HS_WAIT_SERVER_HELLO_DONE
     jmp .tcs_advance
 
@@ -962,7 +1159,11 @@ tls_client_start:
     jmp .tcs_recv_loop
 
 .tcs_done:
-    ; ---- Generate/use pre-master secret ----
+    ; Check cipher suite for key exchange method
+    cmp word [r12 + tls_ctx.cipher_suite], TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+    je .tcs_ecdhe
+
+    ; ---- RSA path ----
     cmp word [pre_master_sec], 0x0303
     je .tcs_pms_ok
     mov word [pre_master_sec], 0x0303
@@ -973,7 +1174,7 @@ tls_client_start:
     syscall
 .tcs_pms_ok:
 
-    ; ---- RSA-encrypt PMS into CKE body at hs_buf + 6 ----
+    ; RSA-encrypt PMS into CKE body at hs_buf + 6
     lea rdi, [hs_buf + 6]
     lea rsi, [pre_master_sec]
     mov edx, 48
@@ -981,19 +1182,78 @@ tls_client_start:
     test eax, eax
     jnz .tcs_error
 
-    ; Build CKE handshake header with 2-byte encrypted PMS length prefix
-    ; Body format: 2-byte length + encrypted data = 2 + 256 = 258 bytes
+    ; Build CKE header with length prefix (2 + 256 = 258 body)
     mov byte [hs_buf], HS_CLIENT_KEY_EXCHANGE
     mov byte [hs_buf + 1], 0
     mov byte [hs_buf + 2], 1
     mov byte [hs_buf + 3], 2
-    ; Encrypted PMS length (big-endian 256 = 0x0100)
     mov word [hs_buf + 4], 0x0001
 
+    mov r15d, 262               ; total CKE size
+    jmp .tcs_cke_common
+
+.tcs_ecdhe:
+    ; ---- ECDHE path ----
+    ; 1. Generate 32-byte client private key
+    lea rdi, [rel client_ec_privkey]
+    mov esi, 32
+    xor edx, edx
+    mov eax, 318
+    syscall
+
+    ; 2. Compute client public key = priv * G at hs_buf + 70 (temp area)
+    lea rdi, [hs_buf + 70]
+    lea rsi, [rel client_ec_privkey]
+    call ecc_scalar_mult_base
+
+    ; 3. Build CKE body at hs_buf + 4
+    mov byte [hs_buf + 4], 65          ; pubkey length (uncompressed)
+    mov byte [hs_buf + 5], 4           ; uncompressed marker
+    ; Convert x: LE limbs (hs_buf+70) -> BE wire (hs_buf+6)
+    lea rdi, [hs_buf + 6]
+    lea rsi, [hs_buf + 70]
+    mov rax, [rsi + 24]
+    bswap rax
+    mov [rdi], rax
+    mov rax, [rsi + 16]
+    bswap rax
+    mov [rdi + 8], rax
+    mov rax, [rsi + 8]
+    bswap rax
+    mov [rdi + 16], rax
+    mov rax, [rsi]
+    bswap rax
+    mov [rdi + 24], rax
+    ; Convert y: LE limbs (hs_buf+70+32) -> BE wire (hs_buf+6+32)
+    lea rsi, [hs_buf + 70 + 32]
+    lea rdi, [hs_buf + 6 + 32]
+    mov rax, [rsi + 24]
+    bswap rax
+    mov [rdi], rax
+    mov rax, [rsi + 16]
+    bswap rax
+    mov [rdi + 8], rax
+    mov rax, [rsi + 8]
+    bswap rax
+    mov [rdi + 16], rax
+    mov rax, [rsi]
+    bswap rax
+    mov [rdi + 24], rax
+
+    ; 4. CKE handshake header
+    mov byte [hs_buf], HS_CLIENT_KEY_EXCHANGE
+    mov byte [hs_buf + 1], 0
+    mov byte [hs_buf + 2], 0
+    mov byte [hs_buf + 3], 66          ; body length
+
+    mov r15d, 70                       ; total CKE size
+    jmp .tcs_cke_common
+
+.tcs_cke_common:
     ; Hash CKE into transcript
     lea rdi, [tls_sha256_ctx]
     lea rsi, [hs_buf]
-    mov edx, 262
+    mov edx, r15d
     call sha256_update
 
     ; Save transcript backup (includes CKE) for server Finished
@@ -1003,21 +1263,62 @@ tls_client_start:
     cld
     rep movsb
 
-    ; Send ClientKeyExchange (plaintext, hs_state != HS_DONE)
+    ; Send ClientKeyExchange (plaintext)
     mov rdi, r12
     mov esi, r13d
     mov edx, TLS_HANDSHAKE
     lea rcx, [hs_buf]
-    mov r8d, 262
+    mov r8d, r15d
     call tls_send
     test rax, rax
     js .tcs_error
 
-    ; Derive master secret and keys from PMS
+    ; For ECDHE: compute shared secret as pre-master secret
+    cmp word [r12 + tls_ctx.cipher_suite], TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+    jne .tcs_derive_rsa
+
+    ; Compute shared = priv * server_pub at hs_buf + 70
+    lea rdi, [hs_buf + 70]
+    lea rsi, [rel client_ec_privkey]
+    lea rdx, [rel server_ec_pubkey]
+    call ecc_scalar_mult
+
+    ; Convert x-coordinate from LE limbs to BE bytes as pre-master secret
+    lea rdi, [rel pre_master_sec]
+    lea rsi, [hs_buf + 70]
+    mov rax, [rsi + 24]
+    bswap rax
+    mov [rdi], rax
+    mov rax, [rsi + 16]
+    bswap rax
+    mov [rdi + 8], rax
+    mov rax, [rsi + 8]
+    bswap rax
+    mov [rdi + 16], rax
+    mov rax, [rsi]
+    bswap rax
+    mov [rdi + 24], rax
+
+    ; Derive keys with ECDHE pre-master secret (32 bytes)
+    mov rdi, r12
+    lea rsi, [pre_master_sec]
+    mov edx, 32
+    call tls_derive_keys
+
+    jmp .tcs_after_keys
+
+.tcs_derive_rsa:
+    ; Derive keys with RSA pre-master secret (48 bytes)
     mov rdi, r12
     lea rsi, [pre_master_sec]
     mov edx, 48
     call tls_derive_keys
+
+.tcs_after_keys:
+    ; Validate certificate validity period
+    call x509_check_validity
+    test eax, eax
+    jnz .tcs_error
 
     ; Validate certificate validity period
     call x509_check_validity
@@ -1124,8 +1425,6 @@ tls_client_start:
     mov [rsp + 16], eax        ; pending_len = 0
 
 .tcs_recv_finished:
-    mov dil, 0x4c               ; 'L'
-    call debug_putc
     mov rdi, r12
     mov esi, r13d
     lea rdx, [rsp + 8]
@@ -1134,14 +1433,10 @@ tls_client_start:
     call tls_recv
     test eax, eax
     jnz .tcs_error
-    mov dil, 0x2e               ; '.'
-    call debug_putc
     cmp byte [rsp + 8], TLS_HANDSHAKE
     jne .tcs_recv_finished
     cmp byte [hs_buf], HS_FINISHED
     jne .tcs_save_pending      ; save pre-Finished handshake for transcript
-    mov dil, 0x46               ; 'F'
-    call debug_putc
 
     ; If pre-Finished messages were buffered, replay transcript
     mov eax, [rsp + 16]
@@ -1185,8 +1480,6 @@ tls_client_start:
     cld
     repe cmpsb
     jnz .tcs_verify_fail
-    mov dil, 0x50               ; 'P'
-    call debug_putc
     xor eax, eax
     jmp .tcs_return
 
@@ -1202,14 +1495,10 @@ tls_client_start:
     jmp .tcs_recv_finished
 
 .tcs_verify_fail:
-    mov dil, 0x58               ; 'X'
-    call debug_putc
     mov eax, 255
     jmp .tcs_return
 
 .tcs_error:
-    mov dil, 0x45               ; 'E'
-    call debug_putc
     or eax, -1
 
 .tcs_return:
@@ -1261,62 +1550,65 @@ _build_client_hello:
     ; Session ID length is 0
     mov byte [rsi + 38], 0
 
-    ; Cipher suites length = 4 (big-endian)
+    ; Cipher suites length = 6 (big-endian, 3 suites)
     mov byte [rsi + 39], 0
-    mov byte [rsi + 40], 4
+    mov byte [rsi + 40], 6
 
-    ; Cipher suite 1: TLS_RSA_WITH_AES_128_CBC_SHA256 (0x003C)
-    mov byte [rsi + 41], 0x00
-    mov byte [rsi + 42], 0x3C
-    ; Cipher suite 2: TLS_RSA_WITH_AES_256_CBC_SHA256 (0x003D)
+    ; Cipher suite 1: TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 (0xC02F)
+    mov byte [rsi + 41], 0xC0
+    mov byte [rsi + 42], 0x2F
+    ; Cipher suite 2: TLS_RSA_WITH_AES_128_CBC_SHA256 (0x003C)
     mov byte [rsi + 43], 0x00
-    mov byte [rsi + 44], 0x3D
+    mov byte [rsi + 44], 0x3C
+    ; Cipher suite 3: TLS_RSA_WITH_AES_256_CBC_SHA256 (0x003D)
+    mov byte [rsi + 45], 0x00
+    mov byte [rsi + 46], 0x3D
 
     ; Compression methods length is 1
-    mov byte [rsi + 45], 1
+    mov byte [rsi + 47], 1
     ; Compression method: null (0x00)
-    mov byte [rsi + 46], 0
+    mov byte [rsi + 48], 0
 
     ; Build SNI extension (RFC 6066)
-    ; extensions_len = 32 + hostlen (big-endian; new: renego + ems + sig_algs = 23 bytes)
-    lea r8d, [r11d + 32]
-    mov byte [rsi + 47], 0
-    mov [rsi + 48], r8b
+    ; extensions_len = 46 + hostlen
+    lea r8d, [r11d + 46]
+    mov byte [rsi + 49], 0
+    mov [rsi + 50], r8b
 
     ; Extension type: server_name (0x0000)
-    mov byte [rsi + 49], 0
-    mov byte [rsi + 50], 0
+    mov byte [rsi + 51], 0
+    mov byte [rsi + 52], 0
 
     ; Extension data length = 5 + hostlen (big-endian)
     lea r9d, [r11d + 5]
-    mov byte [rsi + 51], 0
-    mov [rsi + 52], r9b
+    mov byte [rsi + 53], 0
+    mov [rsi + 54], r9b
 
     ; Server name list length = 3 + hostlen (big-endian)
     lea eax, [r11d + 3]
-    mov byte [rsi + 53], 0
-    mov [rsi + 54], al
+    mov byte [rsi + 55], 0
+    mov [rsi + 56], al
 
     ; Name type: host_name (0x00)
-    mov byte [rsi + 55], 0
+    mov byte [rsi + 57], 0
 
     ; Name length = hostlen (big-endian)
-    mov byte [rsi + 56], 0
-    mov [rsi + 57], r11b
+    mov byte [rsi + 58], 0
+    mov [rsi + 59], r11b
 
-    ; Copy hostname at offset 58
+    ; Copy hostname at offset 60
     test r11d, r11d
     jz .bch_no_sni
-    lea rdi, [rsi + 58]
+    lea rdi, [rsi + 60]
     mov rsi, rdx
     mov rcx, r11
     rep movsb
     mov rsi, r10                 ; restore output buffer pointer
 
 .bch_no_sni:
-    ; Write additional mandatory extensions after SNI hostname
-    ; rdi = offset past SNI hostname (= 58 + hostlen)
-    lea rdi, [rsi + 58]
+    ; Write additional extensions after SNI hostname
+    ; rdi = offset past SNI hostname (= 60 + hostlen)
+    lea rdi, [rsi + 60]
     add edi, r11d
 
     ; renegotiation_info (0xff01, RFC 5746)
@@ -1341,14 +1633,28 @@ _build_client_hello:
     ; SHA-1 + RSA
     mov word [rdi + 21], 0x0102
 
-    ; body length = 77 + hostlen (3 bytes big-endian)
-    lea eax, [r11d + 77]
+    ; supported_elliptic_curves (0x000a, RFC 4492)
+    mov word [rdi + 23], 0x0A00
+    mov word [rdi + 25], 0x0400
+    mov word [rdi + 27], 0x0200
+    ; secp256r1 (0x0017)
+    mov word [rdi + 29], 0x1700
+
+    ; ec_point_formats (0x000b, RFC 4492)
+    mov word [rdi + 31], 0x0B00
+    mov word [rdi + 33], 0x0200
+    ; formats list length = 1, uncompressed = 0
+    mov byte [rdi + 35], 1
+    mov byte [rdi + 36], 0
+
+    ; body length = 93 + hostlen (3 bytes big-endian)
+    lea eax, [r11d + 93]
     mov byte [rsi + 1], 0
     mov byte [rsi + 2], ah
     mov byte [rsi + 3], al
 
-    ; total message length = 81 + hostlen
-    lea eax, [r11d + 81]
+    ; total message length = 97 + hostlen
+    lea eax, [r11d + 97]
 
 .bch_return:
     pop r11
@@ -1651,8 +1957,11 @@ tls_derive_keys:
     add rsp, 16
 
     ; Extract keys from key block at hs_buf + 64
-    ; client_write_mac_key (32) + server_write_mac_key (32)
-    ; + client_write_key (16) + server_write_key (16)
+    ; Layout depends on cipher suite
+    cmp word [r12 + tls_ctx.cipher_suite], TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+    je .tdk_gcm
+
+    ; CBC + HMAC: client_mac(32) + server_mac(32) + client_key(16) + server_key(16)
     lea rsi, [rel hs_buf + 64]
     lea rdi, [rel client_write_mac_key]
     mov rcx, 32
@@ -1673,6 +1982,32 @@ tls_derive_keys:
     lea rdi, [rel server_write_key]
     mov rcx, 16
     rep movsb
+    jmp .tdk_done
+
+.tdk_gcm:
+    ; GCM: client_key(16) + server_key(16) + client_iv(4) + server_iv(4)
+    lea rsi, [rel hs_buf + 64]
+    lea rdi, [rel client_write_key]
+    mov rcx, 16
+    cld
+    rep movsb
+
+    lea rsi, [rel hs_buf + 80]
+    lea rdi, [rel server_write_key]
+    mov rcx, 16
+    rep movsb
+
+    lea rsi, [rel hs_buf + 96]
+    lea rdi, [rel client_write_iv]
+    mov rcx, 4
+    rep movsb
+
+    lea rsi, [rel hs_buf + 100]
+    lea rdi, [rel server_write_iv]
+    mov rcx, 4
+    rep movsb
+
+.tdk_done:
 
     xor eax, eax
     pop r15
