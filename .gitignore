@@ -13,3 +13,6 @@
 # History
 .gdb_history
 repomix-output.xml
+
+# Test stuff
+**/*.pem
