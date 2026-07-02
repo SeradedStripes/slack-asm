@@ -20,3 +20,6 @@ repomix-output.xml
 **/*.pem
 **/*.crt
 **/*.key
+
+# Environment files
+.env
