@@ -12,17 +12,23 @@
 ## [x] Phase 3: TLS
 - [x] SHA-256 (pure assembly, tested with NIST vectors).
 - [x] HMAC-SHA256 (all RFC 4231 test cases pass, including key > block-size branch).
-- [x] TLS record layer (`tls_send`/`tls_recv`, loopback-tested via socketpair).
-- [x] TLS 1.2 handshake, specifically ClientHello → ServerHello + Cert + ServerHelloDone (tested via fork+loopback).
-- [x] TLS 1.3 support if required by Slack (not required — Slack API uses TLS 1.2).
-- [x] AES-128-CBC.
-- [x] Certificate parsing (DER) and basic validation (validity period, RSA key extraction).
-- [x] Integrate with socket layer so all Slack traffic is tunneled over TLS (`tls_connect`/`tls_disconnect` APIs, encrypted send/recv tested).
+- [x] TLS record layer (`tls_send`/`tls_recv`, plaintext + encrypted).
+- [x] AES-128-CBC (encrypt/decrypt with PKCS#7 padding, MAC-then-encrypt).
+- [x] AES-128-GCM with GHASH (GHASH unit-tested against Python `cryptography` library).
+- [x] ECDHE key exchange (P-256, scalar mult + base-point mult, shared secret derivation).
+- [x] TLS 1.2 handshake with `ECDHE-RSA-AES128-GCM-SHA256` (full sequence: CH → SH → Cert → SKE → SHD → CKE → CCS → Finished, server Finished verified).
+- [x] RSA key exchange path (PMS encrypted with server RSA public key, fallback cipher suites).
+- [x] Certificate parsing (DER/X.509), validity period check, RSA key extraction (modulus + exponent).
+- [x] TLS PRF (P_SHA256) for master secret and key block derivation.
+- [x] Transcript hash (SHA-256) for handshake integrity and Finished verify_data.
+- [x] SNI (Server Name Indication) extension in ClientHello.
+- [x] `tls_connect`/`tls_disconnect`/`tls_send`/`tls_recv` API.
 
-## [ ] Phase 4: HTTP
-- [ ] HTTP/1.1 request serialization (method, path, headers, body).
-- [x] HTTP response parsing (status line, headers, Content-Length body).
-- [ ] Wire it to the TLS layer for `https://slack.com/api/*` calls. (I dont know if that api url is the correct one, but you get the idea)
+## [x] Phase 4: HTTP
+- [x] HTTP/1.1 request builder (method, path, headers, Content-Length, body).
+- [x] HTTP response parser (status line, headers, Content-Length body, chunked transfer encoding).
+- [x] Chunked transfer decoding (in-place, supports trailers, chunk extensions).
+- [x] HTTPS integration: full round-trip against real servers (example.com via Cloudflare, local OpenSSL).
 
 ## [ ] Phase 5: Slack Integration
 - [ ] Authenticate with a Slack bot token (OAuth, `Bot-Token` header).
