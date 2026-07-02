@@ -209,7 +209,8 @@ http_finish_headers:
     ret
 
 
-; Write "\r\n" then body at [rdi]
+; Write body bytes at [rdi]
+; Headers must be terminated by \r\n before calling this
 ; rdi = buf, rsi = body, rdx = body_len
 ; Returns rax = bytes written
 http_add_body:
@@ -218,9 +219,6 @@ http_add_body:
 
     mov r12, rdi
     mov r13, rdx
-
-    mov word [rdi], 0x0A0D
-    add rdi, 2
 
     test r13, r13
     jz .ab_done
@@ -351,7 +349,7 @@ http_parse_response:
     ja .hpr_cl_skip_char
 
     mov r14d, 1
-    xor r15d, r15d
+    xor r15, r15
     jmp .hpr_cl_digits
 
 .hpr_cl_skip_char:
@@ -367,8 +365,8 @@ http_parse_response:
     cmp eax, '9'
     ja .hpr_cl_done
     sub eax, '0'
-    imul r15d, 10
-    add r15d, eax
+    imul r15, 10
+    add r15, rax
     inc rsi
     jmp .hpr_cl_digits
 
@@ -455,7 +453,7 @@ http_parse_response:
 
     test r14d, r14d
     jz .hpr_remaining
-    mov [rel http_body_len], r15d
+    mov [rel http_body_len], r15
     mov eax, [rel http_status]
     jmp .hpr_done
 

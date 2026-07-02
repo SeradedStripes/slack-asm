@@ -909,9 +909,18 @@ tls_client_start:
     test eax, eax
     jnz .tcs_error
 
-    ; Must be a Handshake record
+    ; Check record type
     cmp byte [rsp + 8], TLS_HANDSHAKE
+    je .tcs_hs_ok
+    cmp byte [rsp + 8], TLS_ALERT
     jne .tcs_error
+    ; Alert received during handshake - print level + description
+    movzx edi, byte [hs_buf]     ; level (1=warning, 2=fatal)
+    call debug_putc
+    movzx edi, byte [hs_buf + 1] ; alert description
+    call debug_putc
+    jmp .tcs_error
+.tcs_hs_ok:
 
     ; Parse all handshake messages in this fragment thingy
     ; position pointer
