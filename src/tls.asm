@@ -57,8 +57,9 @@ struc tls_ctx
     .cipher_suite   resw 1    ; 115-116
     .hs_state       resb 1    ; 117
     .server_ccs     resb 1    ; 118
+    .ext_ms         resb 1    ; 119
 endstruc
-tls_ctx_size equ 119
+tls_ctx_size equ 120
 
 extern sys_send, sys_recv, sys_close
 extern hmac_sha256
@@ -85,6 +86,8 @@ client_finished_label: db "client finished"
 client_finished_label_len: equ $ - client_finished_label
 server_finished_label: db "server finished"
 server_finished_label_len: equ $ - server_finished_label
+ext_master_label:     db "extended master secret"
+ext_master_label_len: equ $ - ext_master_label
 
 section .bss
 header_buf:  resb TLS_HEADER_SIZE
@@ -106,6 +109,7 @@ record_iv:         resb 16
 record_plaintext:  resb 16448  ; max fragment + 32 MAC + 16 pad
 gcm_nonce:         resb 12     ; fixed_iv(4) + explicit_nonce(8)
 server_ec_pubkey:  resb 64     ; server EC public key (x, y)
+session_hash:      resb 32     ; EMS session hash
 client_ec_privkey: resb 32     ; client EC private key scalar
 tls_sha256_ctx:    resb 104    ; transcript hash SHA-256 context
 tls_digest:        resb 32     ; transcript hash output
@@ -141,6 +145,7 @@ tls_init:
     mov word [rdi + tls_ctx.version], (TLS_VERSION_MAJOR << 8) | TLS_VERSION_MINOR
     mov byte [rdi + tls_ctx.hs_state], 0
     mov byte [rdi + tls_ctx.server_ccs], 0
+    mov byte [rdi + tls_ctx.ext_ms], 0
     ret
 
 ; Build MAC input prefix (seq_num + type + version + length)
@@ -151,7 +156,8 @@ _mac_prefix:
     bswap rax
     mov [rdi], rax
     mov [rdi + 8], dl
-    mov word [rdi + 9], (TLS_VERSION_MAJOR << 8) | TLS_VERSION_MINOR
+    mov byte [rdi + 9], TLS_VERSION_MAJOR
+    mov byte [rdi + 10], TLS_VERSION_MINOR
     mov ax, cx
     ror ax, 8
     mov [rdi + 11], ax
@@ -253,7 +259,8 @@ tls_send:
     ; --- Plaintext send (handshake messages) ---
     lea rsi, [rel header_buf]
     mov [rsi], r14b
-    mov word [rsi + 1], (TLS_VERSION_MAJOR << 8) | TLS_VERSION_MINOR
+    mov byte [rsi + 1], TLS_VERSION_MAJOR
+    mov byte [rsi + 2], TLS_VERSION_MINOR
     mov ax, [rsp]
     ror ax, 8
     mov [rsi + 3], ax
@@ -334,7 +341,8 @@ tls_send:
 
     lea rsi, [rel header_buf]
     mov [rsi], r14b
-    mov word [rsi + 1], (TLS_VERSION_MAJOR << 8) | TLS_VERSION_MINOR
+    mov byte [rsi + 1], TLS_VERSION_MAJOR
+    mov byte [rsi + 2], TLS_VERSION_MINOR
     mov eax, 16
     add eax, ebp
     ror ax, 8
@@ -430,7 +438,8 @@ tls_send:
     ; Record header
     lea rsi, [rel header_buf]
     mov [rsi], r14b
-    mov word [rsi + 1], (TLS_VERSION_MAJOR << 8) | TLS_VERSION_MINOR
+    mov byte [rsi + 1], TLS_VERSION_MAJOR
+    mov byte [rsi + 2], TLS_VERSION_MINOR
     lea eax, [GCM_EXPLICIT_NONCE_LEN + rbp + GCM_TAG_LEN]
     ror ax, 8
     mov [rsi + 3], ax
@@ -1272,6 +1281,18 @@ tls_client_start:
     cld
     rep movsb
 
+    ; Save session hash (for EMS master secret derivation)
+    lea rdi, [tls_sha256_ctx]
+    lea rsi, [session_hash]
+    call sha256_final
+
+    ; Restore SHA-256 context for continued hashing
+    lea rdi, [tls_sha256_ctx]
+    lea rsi, [hs_buf + 2048]
+    mov rcx, 104
+    cld
+    rep movsb
+
     ; Send ClientKeyExchange (plaintext)
     mov rdi, r12
     mov esi, r13d
@@ -1342,7 +1363,8 @@ tls_client_start:
     ; ---- Send ChangeCipherSpec (plaintext) ----
     ; TLS record header
     mov byte [header_buf], TLS_CHANGE_CIPHER_SPEC
-    mov word [header_buf + 1], (TLS_VERSION_MAJOR << 8) | TLS_VERSION_MINOR
+    mov byte [header_buf + 1], TLS_VERSION_MAJOR
+    mov byte [header_buf + 2], TLS_VERSION_MINOR
     mov ax, 0x0001
     ror ax, 8
     mov [header_buf + 3], ax
@@ -1579,8 +1601,8 @@ _build_client_hello:
     mov byte [rsi + 48], 0
 
     ; Build SNI extension (RFC 6066)
-    ; extensions_len = 46 + hostlen
-    lea r8d, [r11d + 46]
+    ; extensions_len = 50 + hostlen
+    lea r8d, [r11d + 50]
     mov byte [rsi + 49], 0
     mov [rsi + 50], r8b
 
@@ -1625,45 +1647,49 @@ _build_client_hello:
     mov word [rdi + 2], 0x0100
     mov byte [rdi + 4], 0
 
-    ; extended_master_secret (0x0023, RFC 7627)
+    ; session_ticket (0x0023, RFC 5077)
     mov word [rdi + 5], 0x2300
     mov word [rdi + 7], 0x0000
 
+    ; extended_master_secret (0x0017, RFC 7627)
+    mov word [rdi + 9], 0x1700
+    mov word [rdi + 11], 0x0000
+
     ; signature_algorithms (0x000d, RFC 5246)
-    mov word [rdi + 9], 0x0D00
-    mov word [rdi + 11], 0x0A00
-    mov word [rdi + 13], 0x0800
+    mov word [rdi + 13], 0x0D00
+    mov word [rdi + 15], 0x0A00
+    mov word [rdi + 17], 0x0800
     ; SHA-256 + RSA
-    mov word [rdi + 15], 0x0104
+    mov word [rdi + 19], 0x0104
     ; SHA-384 + RSA
-    mov word [rdi + 17], 0x0105
+    mov word [rdi + 21], 0x0105
     ; RSA-PSS + SHA-256
-    mov word [rdi + 19], 0x0408
+    mov word [rdi + 23], 0x0408
     ; SHA-1 + RSA
-    mov word [rdi + 21], 0x0102
+    mov word [rdi + 25], 0x0102
 
     ; supported_elliptic_curves (0x000a, RFC 4492)
-    mov word [rdi + 23], 0x0A00
-    mov word [rdi + 25], 0x0400
-    mov word [rdi + 27], 0x0200
+    mov word [rdi + 27], 0x0A00
+    mov word [rdi + 29], 0x0400
+    mov word [rdi + 31], 0x0200
     ; secp256r1 (0x0017)
-    mov word [rdi + 29], 0x1700
+    mov word [rdi + 33], 0x1700
 
     ; ec_point_formats (0x000b, RFC 4492)
-    mov word [rdi + 31], 0x0B00
-    mov word [rdi + 33], 0x0200
+    mov word [rdi + 35], 0x0B00
+    mov word [rdi + 37], 0x0200
     ; formats list length = 1, uncompressed = 0
-    mov byte [rdi + 35], 1
-    mov byte [rdi + 36], 0
+    mov byte [rdi + 39], 1
+    mov byte [rdi + 40], 0
 
-    ; body length = 93 + hostlen (3 bytes big-endian)
-    lea eax, [r11d + 93]
+    ; body length = 97 + hostlen (3 bytes big-endian)
+    lea eax, [r11d + 97]
     mov byte [rsi + 1], 0
     mov byte [rsi + 2], ah
     mov byte [rsi + 3], al
 
-    ; total message length = 97 + hostlen
-    lea eax, [r11d + 97]
+    ; total message length = 101 + hostlen
+    lea eax, [r11d + 101]
 
 .bch_return:
     pop r11
@@ -1746,9 +1772,42 @@ _parse_server_hello:
     ; Compression method (1 byte) - skip
     lea ecx, [rcx + 1]
 
-    ; Extensions - skip entirely for now
-    ; (if body has more data, it's extensions we don't parse it)
+    ; Check if body has remaining data (extensions)
+    cmp rdx, rcx
+    jbe .psh_no_ext
 
+    ; Read extensions_length (2 bytes, big-endian)
+    mov ax, [r11 + rcx]
+    xchg al, ah
+    movzx eax, ax
+    ; Skip extensions_length field
+    lea ecx, [rcx + 2]
+    ; If no extensions, skip parsing
+    test eax, eax
+    jz .psh_no_ext
+    ; Compute end of extensions region
+    lea r8, [rcx + rax]
+.psh_ext_loop:
+    cmp r8, rcx
+    jbe .psh_ext_done
+    ; Extension type at [r11 + rcx] (2 bytes BE)
+    mov ax, [r11 + rcx]
+    xchg al, ah
+    ; Extension data length at [r11 + rcx + 2] (2 bytes BE)
+    mov dx, [r11 + rcx + 2]
+    xchg dl, dh
+    movzx edx, dx
+    lea ecx, [rcx + 4]   ; past type + length
+    ; Check if this is extended_master_secret (0x0017)
+    cmp ax, 0x0017
+    jne .psh_ext_next
+    mov byte [r10 + tls_ctx.ext_ms], 1
+.psh_ext_next:
+    add ecx, edx         ; skip extension data
+    jmp .psh_ext_loop
+.psh_ext_done:
+
+.psh_no_ext:
     xor eax, eax
     jmp .psh_return
 
@@ -1914,10 +1973,24 @@ tls_derive_keys:
     ; pre_master_len
     mov r14, rdx
 
-    ; Build seed = client_random + server_random in hs_buf.
+    ; Build seed in hs_buf.
     ; Note: must NOT use prf_seed_buf - tls_prf uses it internally
     ; for (label + seed) construction, and if seed pointer overlaps
     ; with prf_seed_buf, the label copy corrupts the source seed.
+    cmp byte [r12 + tls_ctx.ext_ms], 0
+    je .tdk_no_ems
+
+    ; EMS: seed = session_hash (32 bytes)
+    lea rdi, [rel hs_buf]
+    lea rsi, [rel session_hash]
+    mov rcx, 32
+    cld
+    rep movsb
+    mov r9, 32
+    jmp .tdk_do_master
+
+.tdk_no_ems:
+    ; Standard: seed = client_random + server_random (64 bytes)
     lea rdi, [rel hs_buf]
     lea rsi, [r12 + tls_ctx.client_random]
     mov rcx, 32
@@ -1927,14 +2000,29 @@ tls_derive_keys:
     lea rsi, [r12 + tls_ctx.server_random]
     mov rcx, 32
     rep movsb
+    mov r9, 64
 
-    ; PRF(pre_master, "master secret", seed, master_secret, 48)
+.tdk_do_master:
+    ; PRF(pre_master, seed, master_secret, 48)
     mov rdi, r13
     mov rsi, r14
+    cmp byte [r12 + tls_ctx.ext_ms], 0
+    je .tdk_std_label
+    lea rdx, [rel ext_master_label]
+    mov rcx, ext_master_label_len
+    jmp .tdk_do_prf
+.tdk_std_label:
     lea rdx, [rel master_label]
     mov rcx, master_label_len
+.tdk_do_prf:
     lea r8, [rel hs_buf]
+    cmp byte [r12 + tls_ctx.ext_ms], 0
+    jne .tdk_master_ems_seed
     mov r9, 64
+    jmp .tdk_master_do_prf
+.tdk_master_ems_seed:
+    mov r9, 32
+.tdk_master_do_prf:
     lea rax, [rel master_secret]
     push 48
     push rax

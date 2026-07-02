@@ -99,8 +99,8 @@ dotenv:          db ".env", 0
 slack_token_key: db "SLACK_TOKEN="
 
 section .bss
-api_tls:    resb 119
-ws_tls:     resb 119
+api_tls:    resb 120
+ws_tls:     resb 120
 reqbuf:     resb 4096
 recvbuf:    resb RECV_BUF_SIZE
 ws_url:     resb 512        ; WebSocket URL string
