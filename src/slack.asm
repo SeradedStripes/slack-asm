@@ -2,9 +2,13 @@
 BITS 64
 default rel
 
+%define SYS_read   0
 %define SYS_write  1
+%define SYS_open   2
+%define SYS_close  3
 %define SYS_exit   60
 %define STDOUT     1
+%define O_RDONLY   0
 %define AF_INET    2
 %define SOCK_STREAM 1
 %define TLS_APPLICATION_DATA 23
@@ -91,6 +95,8 @@ v_wsver_len:     equ $ - v_wsver
 
 key_json:        db '"url"'
 key_json_len:    equ 5
+dotenv:          db ".env", 0
+slack_token_key: db "SLACK_TOKEN="
 
 section .bss
 api_tls:    resb 119
@@ -108,6 +114,8 @@ wstype:     resb 1
 wslen:      resq 1
 ws_host_len: resq 1
 ws_path_len: resq 1
+envbuf:     resb 4096           ; .env file read buffer
+envtoken:   resb 256            ; extracted token from .env
 
 section .text
 global _start
@@ -115,7 +123,22 @@ global _start
 _start:
     pop rcx                     ; argc
     cmp ecx, 2
-    jl .usage
+    jge .from_argv
+
+    ; Try reading token from .env
+    call load_env_token
+    test eax, eax
+    jnz .go_env
+
+.usage:
+    lea rsi, [tag_fail]
+    mov edx, tag_fail_len
+    call pstr
+    mov edi, 1
+    mov eax, SYS_exit
+    syscall
+
+.from_argv:
     pop rax                     ; argv[0]
     pop r12                     ; argv[1] = bot token
     ; strlen
@@ -133,11 +156,13 @@ _start:
     mov edi, eax
     mov eax, SYS_exit
     syscall
-.usage:
-    lea rsi, [tag_fail]
-    mov edx, tag_fail_len
-    call pstr
-    mov edi, 1
+
+.go_env:
+    mov r12, rdi                ; token ptr from load_env_token
+    mov r13, rsi                ; token len
+    xor ebp, ebp
+    call main
+    mov edi, eax
     mov eax, SYS_exit
     syscall
 
@@ -813,7 +838,107 @@ slack_api:
     pop rbx
     ret
 
-; Print helpers
+; Load Slack token from .env file (line: SLACK_TOKEN=value)
+; Returns 0 on failure, nonzero on success.
+; On success: rdi = token ptr, rsi = token length
+load_env_token:
+    ; Open .env
+    lea rdi, [rel dotenv]
+    mov esi, O_RDONLY
+    xor edx, edx
+    mov eax, SYS_open
+    syscall
+    test eax, eax
+    js .let_done
+    mov ebx, eax                ; fd
+
+    ; Read
+    mov edi, ebx                ; fd
+    lea rsi, [envbuf]
+    mov edx, 4096
+    mov eax, SYS_read
+    syscall
+    test rax, rax
+    jle .let_read_fail
+    mov r12, rax                ; total bytes read
+    jmp .let_close_ok
+
+.let_read_fail:
+    mov edi, ebx
+    mov eax, SYS_close
+    syscall
+    xor eax, eax
+    ret
+
+.let_close_ok:
+    mov edi, ebx
+    mov eax, SYS_close
+    syscall
+
+    ; Scan envbuf line by line for "SLACK_TOKEN="
+    lea r8, [envbuf]
+    mov r9, r12                 ; remaining bytes
+.let_line_loop:
+    test r9, r9
+    jz .let_done
+    ; Check if this line starts with "SLACK_TOKEN="
+    cmp r9, 12
+    jb .let_next_line
+    cmp dword [r8], 'SLAC'
+    jne .let_next_line
+    cmp dword [r8 + 4], 'K_TO'
+    jne .let_next_line
+    cmp dword [r8 + 8], 'KEN='
+    jne .let_next_line
+    ; Found! r8 points to "SLACK_TOKEN="
+    add r8, 12                  ; skip key to get value start
+    mov rdi, r8                 ; value start
+    xor ecx, ecx
+.let_scan_val:
+    cmp rcx, r9
+    jae .let_copy_val
+    cmp byte [rdi + rcx], 0x0A
+    je .let_copy_val
+    cmp byte [rdi + rcx], 0x0D
+    je .let_copy_val
+    inc rcx
+    jmp .let_scan_val
+.let_copy_val:
+    test ecx, ecx
+    jz .let_next_line
+    cmp ecx, 255
+    jb .let_copy2
+    mov ecx, 255
+.let_copy2:
+    mov r12, rcx                ; save length
+    lea rdi, [envtoken]
+    mov rsi, r8                 ; start of value
+    rep movsb
+    mov byte [rdi], 0
+    lea rdi, [envtoken]
+    mov rsi, r12
+    mov eax, 1
+    ret
+
+.let_next_line:
+    ; Skip to next line
+    xor ecx, ecx
+.let_skip:
+    cmp rcx, r9
+    jae .let_done
+    cmp byte [r8 + rcx], 0x0A
+    je .let_advance
+    inc rcx
+    jmp .let_skip
+.let_advance:
+    inc rcx
+    add r8, rcx
+    sub r9, rcx
+    jmp .let_line_loop
+.let_done:
+    xor eax, eax
+    ret
+
 print_banner:
     lea rsi, [banner]
     mov edx, banner_len
