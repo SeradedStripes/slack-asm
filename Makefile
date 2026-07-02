@@ -22,7 +22,7 @@ gcm_test: src/gcm_test.o src/gcm.o src/crypto.o
 	$(NASM) $(NASMFLAGS) -o $@ $<
 
 clean:
-	rm -f $(OBJS) src/rsa_test.o src/gcm_test.o slack rsa_test gcm_test
+	rm -f $(OBJS) src/prf_test.o src/rsa_test.o src/gcm_test.o slack rsa_test gcm_test
 
 test: all
 	@echo "Running tests (binary: ./slack)"
