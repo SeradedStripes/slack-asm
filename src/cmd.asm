@@ -83,7 +83,7 @@ cmd_register:
 
     mov ecx, cmd_entry_size
     mul ecx
-    lea rbx, [rel cmd_table + rax]
+    lea rbx, [cmd_table + rax]
 
     pop rdx
     mov [rbx + cmd_entry.name_ptr], rdi
@@ -248,7 +248,7 @@ cmd_dispatch:
     mov eax, r15d
     mov ecx, cmd_entry_size
     mul ecx
-    lea r12, [rel cmd_table + rax]
+    lea r12, [cmd_table + rax]
 
     cmp dword [r12 + cmd_entry.flags], CMD_NAMESPACED
     jne .ns_next
@@ -352,7 +352,7 @@ cmd_dispatch:
     mov eax, ebx
     mov ecx, cmd_entry_size
     mul ecx
-    lea r15, [rel cmd_table + rax]
+    lea r15, [cmd_table + rax]
 
     cmp dword [r15 + cmd_entry.flags], CMD_DIRECT
     jne .dir_next
