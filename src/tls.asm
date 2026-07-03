@@ -142,7 +142,7 @@ tls_init:
     xor eax, eax
     mov [rdi + tls_ctx.write_seq], rax
     mov [rdi + tls_ctx.read_seq], rax
-    mov word [rdi + tls_ctx.version], (TLS_VERSION_MAJOR << 8) | TLS_VERSION_MINOR
+    mov word [rdi + tls_ctx.version], (TLS_VERSION_MAJOR << 8) | 1   ; start with {3,1} for ClientHello RFC 5246 §6.2.1
     mov byte [rdi + tls_ctx.hs_state], 0
     mov byte [rdi + tls_ctx.server_ccs], 0
     mov byte [rdi + tls_ctx.ext_ms], 0
@@ -259,8 +259,9 @@ tls_send:
     ; --- Plaintext send (handshake messages) ---
     lea rsi, [rel header_buf]
     mov [rsi], r14b
-    mov byte [rsi + 1], TLS_VERSION_MAJOR
-    mov byte [rsi + 2], TLS_VERSION_MINOR
+    mov ax, [r12 + tls_ctx.version]  ; Use negotiated version (initially {3,1} for ClientHello)
+    xchg al, ah                     ; host order → big-endian in memory
+    mov [rsi + 1], ax
     mov ax, [rsp]
     ror ax, 8
     mov [rsi + 3], ax
@@ -386,19 +387,32 @@ tls_send:
     cld
     rep movsb
 
-    ; Generate 8-byte explicit nonce
-    lea rdi, [rel gcm_nonce + 4]
-    mov esi, GCM_EXPLICIT_NONCE_LEN
-    xor edx, edx
-    mov eax, 318
-    syscall
+    ; DEBUG: dump plaintext before encryption
+    push rax
+    push rdi
+    push rsi
+    push rcx
+    lea rdi, [rel record_plaintext + GCM_EXPLICIT_NONCE_LEN]
+    mov esi, [rsp + 32]
+    call debug_hexdump
+    pop rcx
+    pop rsi
+    pop rdi
+    pop rax
 
-    ; Build full nonce: fixed_iv (4) + explicit (8) at gcm_nonce
+    ; Build full nonce: fixed_iv (4) + seq_num (8) at gcm_nonce
     lea rdi, [rel gcm_nonce]
     lea rsi, [rel client_write_iv]
     mov rcx, 4
     cld
     rep movsb
+
+    ; Copy write_seq as explicit nonce (network byte order)
+    lea rdi, [rel gcm_nonce + 4]
+    lea rsi, [r12 + tls_ctx.write_seq]
+    mov rax, [rsi]
+    bswap rax
+    mov [rdi], rax
 
     ; Build AAD (13 bytes) via _mac_prefix
     lea rdi, [rel mac_header_buf]
@@ -427,6 +441,41 @@ tls_send:
     call aes128_gcm_encrypt
     lea rax, [rsp + 16]
     add rsp, 16
+
+    ; DEBUG: dump key and nonce
+    push rbp
+    push rdi
+    push rsi
+    lea rdi, [rel client_write_key]
+    mov esi, 16
+    call debug_hexdump
+    lea rdi, [rel gcm_nonce]
+    mov esi, 12
+    call debug_hexdump
+    lea rdi, [rel mac_header_buf]
+    mov esi, 13
+    call debug_hexdump
+    pop rsi
+    pop rdi
+    pop rbp
+
+    ; DEBUG: dump ciphertext after encryption
+    push rbp
+    push rdi
+    push rsi
+    push rcx
+    lea rdi, [rel record_plaintext + GCM_EXPLICIT_NONCE_LEN]
+    mov esi, ebp
+    call debug_hexdump
+    ; Also dump tag
+    lea rdi, [rel record_plaintext + GCM_EXPLICIT_NONCE_LEN]
+    add rdi, rbp
+    mov esi, 16
+    call debug_hexdump
+    pop rcx
+    pop rsi
+    pop rdi
+    pop rbp
 
     ; Copy explicit_nonce to front of record_plaintext
     lea rdi, [rel record_plaintext]
@@ -1601,8 +1650,8 @@ _build_client_hello:
     mov byte [rsi + 48], 0
 
     ; Build SNI extension (RFC 6066)
-    ; extensions_len = 50 + hostlen
-    lea r8d, [r11d + 50]
+    ; extensions_len = 65 + hostlen (includes ALPN)
+    lea r8d, [r11d + 65]
     mov byte [rsi + 49], 0
     mov [rsi + 50], r8b
 
@@ -1682,14 +1731,22 @@ _build_client_hello:
     mov byte [rdi + 39], 1
     mov byte [rdi + 40], 0
 
-    ; body length = 97 + hostlen (3 bytes big-endian)
-    lea eax, [r11d + 97]
+    ; application_layer_protocol_negotiation (0x0010, RFC 7301)
+    mov word [rdi + 41], 0x1000     ; type 0x0010
+    mov word [rdi + 43], 0x0B00     ; data length 11 (0x000b)
+    mov word [rdi + 45], 0x0900     ; protocol list length 9 (0x0009)
+    mov byte [rdi + 47], 8          ; "http/1.1" length
+    mov dword [rdi + 48], 'http'    ; "http"
+    mov dword [rdi + 52], '/1.1'    ; "/1.1"
+
+    ; body length = 112 + hostlen (3 bytes big-endian)
+    lea eax, [r11d + 112]
     mov byte [rsi + 1], 0
     mov byte [rsi + 2], ah
     mov byte [rsi + 3], al
 
-    ; total message length = 101 + hostlen
-    lea eax, [r11d + 101]
+    ; total message length = 116 + hostlen
+    lea eax, [r11d + 116]
 
 .bch_return:
     pop r11
@@ -1722,7 +1779,10 @@ _parse_server_hello:
     ; body pointer
     mov r11, rsi
 
-    ; Version at [r11+0] (2 bytes) - skip for now
+    ; Store negotiated version from ServerHello into ctx.version
+    mov ax, [r11]
+    xchg al, ah                     ; big-endian → host order
+    mov [r10 + tls_ctx.version], ax
 
     ; Copy server random: body bytes 2-33 → ctx.server_random
     mov r8, [r11 + 2]

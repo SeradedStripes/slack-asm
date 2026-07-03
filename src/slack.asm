@@ -72,6 +72,10 @@ h_close:         db "Connection"
 h_close_len:     equ $ - h_close
 v_close:         db "close"
 v_close_len:     equ $ - v_close
+h_accept:        db "Accept"
+h_accept_len:    equ $ - h_accept
+v_accept:        db "*/*"
+v_accept_len:    equ $ - v_accept
 h_clen:          db "Content-Length"
 h_clen_len:      equ $ - h_clen
 v_clen:          db "2"
@@ -684,12 +688,12 @@ slack_api:
     call http_add_header
     add r15d, eax
 
-    ; Connection: close
+    ; Accept: */*
     lea rdi, [reqbuf + r15]
-    lea rsi, [h_close]
-    mov edx, h_close_len
-    lea rcx, [v_close]
-    mov r8d, v_close_len
+    lea rsi, [h_accept]
+    mov edx, h_accept_len
+    lea rcx, [v_accept]
+    mov r8d, v_accept_len
     call http_add_header
     add r15d, eax
 
@@ -711,6 +715,10 @@ slack_api:
     mov word [reqbuf + r15], '{}'
     add r15d, 2
 
+    ; Debug: hex dump request
+    lea rsi, [reqbuf]
+    mov edx, r15d
+    call hex_dump
     ; Send POST request via TLS
     lea rdi, [api_tls]
     mov esi, r14d
@@ -743,6 +751,11 @@ slack_api:
 .recv_done:
     test ebp, ebp
     jz .disc
+
+    ; Debug: dump response
+    lea rsi, [recvbuf]
+    mov edx, ebp
+    call hex_dump
 
     ; Parse HTTP
     lea rdi, [recvbuf]
@@ -937,6 +950,65 @@ load_env_token:
     jmp .let_line_loop
 .let_done:
     xor eax, eax
+    ret
+
+; Hex dump, rsi = data, edx = length
+hex_dump:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rsi
+    mov r12, rsi
+    mov r13d, edx
+    xor r14d, r14d
+.hd_loop:
+    cmp r14d, r13d
+    jae .hd_done
+    movzx eax, byte [r12 + r14]
+    mov r15d, eax
+    shr eax, 4
+    and eax, 0x0F
+    lea eax, [rax + '0']
+    cmp eax, '9'
+    jbe .hd_low
+    add eax, 'A' - '9' - 1
+.hd_low:
+    mov byte [rsp + 6], al
+    mov eax, r15d
+    and eax, 0x0F
+    lea eax, [rax + '0']
+    cmp eax, '9'
+    jbe .hd_hi
+    add eax, 'A' - '9' - 1
+.hd_hi:
+    mov byte [rsp + 7], al
+    lea rsi, [rsp + 6]
+    mov edx, 2
+    mov eax, SYS_write
+    mov edi, STDOUT
+    syscall
+    inc r14d
+    mov eax, r14d
+    and eax, 0x1F
+    jnz .hd_loop
+    mov byte [rsp + 6], 10
+    lea rsi, [rsp + 6]
+    mov edx, 1
+    call pstr
+    jmp .hd_loop
+.hd_done:
+    mov byte [rsp + 6], 10
+    lea rsi, [rsp + 6]
+    mov edx, 1
+    call pstr
+    pop rsi
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
     ret
 
 print_banner:

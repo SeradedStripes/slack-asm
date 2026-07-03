@@ -357,14 +357,16 @@ aes128_gcm_encrypt:
     jmp .ge_ctr
 
 .ge_partial:
-    mov [rsp + 160], eax         ; save remaining byte count
+    mov [rsp + 192], eax         ; save remaining byte count (J0 is dead)
 
     lea rdi, [rsp + 224]
     lea rsi, [rsp]
     lea rdx, [rsp + 240]
     call aes128_encrypt_block
 
-    mov eax, [rsp + 160]         ; restore remaining byte count
+
+
+    mov eax, [rsp + 192]         ; restore remaining byte count
     xor r11d, r11d
 .ge_part_loop:
     test eax, eax
