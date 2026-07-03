@@ -74,11 +74,10 @@ json_get_str:
     cmp rcx, r13
     jae .jgs_not_found
 
-    ; Check for key match at current position
-    cmp r15, r13
-    sub r15, rcx
+    ; Check: offset + key_len <= buf_len
+    lea rax, [rcx + r15]
+    cmp rax, r13
     ja .jgs_not_found
-    add r15, rcx              ; restore r15
 
     push rcx
     push rdi

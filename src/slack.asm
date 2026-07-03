@@ -29,6 +29,7 @@ extern ws_send_frame, ws_recv_frame
 extern json_get_str, parse_wss_url
 extern debug_putc
 extern base64_encode
+extern cmd_init, cmd_register_all, cmd_dispatch
 
 ; WebSocket opcodes
 %define WS_TEXT  0x1
@@ -120,6 +121,10 @@ ws_host_len: resq 1
 ws_path_len: resq 1
 envbuf:     resb 4096           ; .env file read buffer
 envtoken:   resb 256            ; extracted token from .env
+
+global ws_ctx_ptr, ws_fd
+ws_ctx_ptr: resq 1             ; WebSocket TLS context pointer for command handlers
+ws_fd:      resd 1             ; WebSocket fd for command handlers
 
 section .text
 global _start
@@ -298,6 +303,11 @@ main:
     call tls_connect
     test eax, eax
     jnz .close_sock
+
+    ; Store WS context and fd for command handlers
+    lea rax, [ws_tls]
+    mov [rel ws_ctx_ptr], rax
+    mov [rel ws_fd], r14d
 
     ; Step 6: WS key (16 random bytes -> base64)
     lea rdi, [ws_key]
@@ -497,6 +507,19 @@ main:
     test eax, eax
     jz .ws_recv_done
     add ebp, eax
+    ; Incremental HTTP parse: if complete, exit loop
+    lea r15, [recvbuf]
+    mov rdi, r15
+    mov esi, ebp
+    call http_parse_response
+    test eax, eax
+    js .ws_recv_skip
+    mov rax, [rel http_body_ptr]
+    sub rax, r15
+    add rax, [rel http_body_len]
+    cmp rax, rbp
+    jbe .ws_recv_done
+.ws_recv_skip:
     cmp ebp, RECV_BUF_SIZE - 16384
     jb .ws_recv
 .ws_recv_done:
@@ -516,6 +539,11 @@ main:
     lea rsi, [tag_connected]
     mov edx, tag_connected_len
     call pstr
+
+    ; Step 9: Init command framework and enter event loop
+    call cmd_init
+    call cmd_register_all
+
     jmp .frame_loop
 
 .bad_ws:
@@ -527,7 +555,6 @@ main:
     call pnl
     jmp .close_ws
 
-    ; Step 9: Frame event loop
 .frame_loop:
     lea rdi, [ws_tls]
     mov esi, r14d
@@ -555,6 +582,9 @@ main:
     mov edx, [rel wslen]
     call pstr
     call pnl
+    lea rdi, [recvbuf]
+    mov esi, [rel wslen]
+    call cmd_dispatch
     jmp .frame_loop
 
 .got_ping:
@@ -746,6 +776,22 @@ slack_api:
     test eax, eax
     jz .recv_done
     add ebp, eax
+    ; Try parsing HTTP response so far to detect completeness
+    push rbp
+    lea rdi, [recvbuf]
+    mov esi, ebp
+    call http_parse_response
+    pop rbp
+    test eax, eax
+    js .recv_cont
+    ; Parsing succeeded: check if full body is present
+    mov rax, [rel http_body_ptr]
+    lea rcx, [recvbuf]
+    sub rax, rcx                ; header length
+    add rax, [rel http_body_len] ; total expected response length
+    cmp rax, rbp
+    jbe .recv_done              ; full response received
+.recv_cont:
     cmp ebp, RECV_BUF_SIZE - 16384
     jb .recv
 .recv_done:
@@ -757,7 +803,7 @@ slack_api:
     mov edx, ebp
     call hex_dump
 
-    ; Parse HTTP
+    ; Parse HTTP (may be redundant if already parsed in loop, but harmless)
     lea rdi, [recvbuf]
     mov esi, ebp
     call http_parse_response
@@ -800,6 +846,33 @@ slack_api:
     cld
     rep movsb
     mov byte [rdi], 0           ; null-terminate (optional)
+
+    ; Unescape JSON: replace "\/" with "/" in-place
+    lea rdi, [ws_url]
+    xor ecx, ecx
+    xor edx, edx
+.unesc_loop:
+    cmp ecx, r13d
+    jae .unesc_done
+    mov al, [rdi + rcx]
+    cmp al, '\'
+    jne .unesc_copy
+    mov eax, ecx
+    inc eax
+    cmp eax, r13d
+    jae .unesc_copy
+    cmp byte [rdi + rcx + 1], '/'
+    jne .unesc_copy
+    inc ecx
+    mov al, [rdi + rcx]
+.unesc_copy:
+    mov [rdi + rdx], al
+    inc ecx
+    inc edx
+    jmp .unesc_loop
+.unesc_done:
+    mov byte [rdi + rdx], 0
+    mov r13d, edx
 
     ; Disconnect
     lea rdi, [api_tls]
