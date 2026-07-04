@@ -23,7 +23,8 @@ msg_pong:           db "pong"
 msg_pong_len:       equ $ - msg_pong
 
 msg_help_text:      db "Available commands:", 0x0A
-                    db "/slack-asm ping - Check bot latency"
+                    db "/slack-asm help - Displays this help message.", 0x0A
+                    db "/slack-asm ping - Returns 'pong' in response.", 0x0A
 msg_help_text_len:  equ $ - msg_help_text
 
 section .text
