@@ -1,0 +1,62 @@
+BITS 64
+default rel
+
+global run_aes_cbc_tests
+
+extern aes128_cbc_encrypt, aes128_cbc_decrypt
+
+section .rodata
+aes_key:
+db 0x2b,0x7e,0x15,0x16,0x28,0xae,0xd2,0xa6
+db 0xab,0xf7,0x15,0x88,0x09,0xcf,0x4f,0x3c
+aes_iv:
+db 0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07
+db 0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f
+aes_plain:
+db 0x6b,0xc1,0xbe,0xe2,0x2e,0x40,0x9f,0x96
+db 0xe9,0x3d,0x7e,0x11,0x73,0x93,0x17,0x2a
+aes_expected:
+db 0x76,0x49,0xab,0xac,0x81,0x19,0xb2,0x46
+db 0xce,0xe9,0x8e,0x9b,0x12,0xe9,0x19,0x7d
+
+section .bss
+aes_cipher:    resb 16
+aes_decrypted: resb 16
+
+section .text
+run_aes_cbc_tests:
+    ; Encrypt
+    lea rdi, [rel aes_key]
+    lea rsi, [rel aes_iv]
+    lea rdx, [rel aes_plain]
+    mov rcx, 16
+    lea r8, [rel aes_cipher]
+    call aes128_cbc_encrypt
+
+    lea rsi, [rel aes_cipher]
+    lea rdi, [rel aes_expected]
+    mov ecx, 16
+    cld
+    repe cmpsb
+    jnz .fail
+
+    ; Decrypt
+    lea rdi, [rel aes_key]
+    lea rsi, [rel aes_iv]
+    lea rdx, [rel aes_cipher]
+    mov rcx, 16
+    lea r8, [rel aes_decrypted]
+    call aes128_cbc_decrypt
+
+    lea rsi, [rel aes_decrypted]
+    lea rdi, [rel aes_plain]
+    mov ecx, 16
+    cld
+    repe cmpsb
+    jnz .fail
+
+    xor eax, eax
+    ret
+.fail:
+    mov eax, 1
+    ret

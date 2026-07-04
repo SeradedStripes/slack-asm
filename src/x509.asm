@@ -223,11 +223,13 @@ _datetime_epoch:
 ; rdi=DER data, rsi=length
 ; -> rax=0 ok, -1 error
 x509_parse_cert:
+    push rbp
     push rbx
     push r12
     push r13
     push r14
     push r15
+    mov rbp, rsp
 
     ; Certificate SEQUENCE
     mov cl, ASN_SEQUENCE
@@ -464,12 +466,14 @@ x509_parse_cert:
 
 .xp_err:
     stc
+    mov rsp, rbp
 .xp_done:
     pop r15
     pop r14
     pop r13
     pop r12
     pop rbx
+    pop rbp
     mov rax, -1
     jc .xp_err_ret
     xor eax, eax

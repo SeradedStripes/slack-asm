@@ -76,8 +76,12 @@ extern aes128_gcm_encrypt
 extern aes128_gcm_decrypt
 extern debug_putc
 extern debug_hexdump
+extern debug_puts
 
 section .rodata
+debug_label_cli: db "CLI: ", 0
+debug_label_srv: db "SRV: ", 0
+debug_label_prf: db "PRF: ", 0
 master_label:       db "master secret"
 master_label_len:   equ $ - master_label
 key_expansion_label: db "key expansion"
@@ -1393,6 +1397,31 @@ tls_client_start:
     mov edx, 48
     call tls_derive_keys
 
+    push rdi
+    push rsi
+    mov rdi, 2
+    lea rsi, [rel debug_label_cli]
+    mov edx, 5
+    mov eax, 1
+    syscall
+    lea rdi, [rel master_secret]
+    mov esi, 16
+    call debug_hexdump
+    lea rdi, [rel client_write_key]
+    mov esi, 16
+    call debug_hexdump
+    lea rdi, [r12 + 18]
+    mov esi, 16
+    call debug_hexdump
+    lea rdi, [r12 + 50]
+    mov esi, 16
+    call debug_hexdump
+    lea rdi, [rel pre_master_sec]
+    mov esi, 16
+    call debug_hexdump
+    pop rsi
+    pop rdi
+
 .tcs_after_keys:
     ; Validate certificate validity period
     call x509_check_validity
@@ -1939,6 +1968,23 @@ tls_prf:
     mov rcx, rbp
     lea r8, [rel prf_abuf]
     call hmac_sha256
+
+    ; DEBUG: dump A(1) and seed_buf
+    push r14
+    push r15
+    mov rdi, 2
+    lea rsi, [rel debug_label_prf]
+    mov edx, 5
+    mov eax, 1
+    syscall
+    lea rdi, [rel prf_seed_buf]
+    mov esi, 77
+    call debug_hexdump
+    lea rdi, [rel prf_abuf]
+    mov esi, 32
+    call debug_hexdump
+    pop r15
+    pop r14
 
     ; Main P_SHA256 loop
     ; output pointer
