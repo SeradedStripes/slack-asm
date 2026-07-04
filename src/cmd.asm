@@ -42,19 +42,21 @@ key_user_len:       equ $ - key_user
 key_envelope_id:    db '"envelope_id"'
 key_envelope_id_len: equ $ - key_envelope_id
 
-resp_prefix:  db '{"envelope_id":"'
-resp_prefix_len:  equ $ - resp_prefix
-resp_middle:  db '","payload":{"text":"'
-resp_middle_len:  equ $ - resp_middle
-resp_suffix:  db '"}}'
-resp_suffix_len:  equ $ - resp_suffix
+resp_prefix:          db '{"envelope_id":"'
+resp_prefix_len:      equ $ - resp_prefix
+resp_mid_ephemeral:   db '","payload":{"text":"'
+resp_mid_ephemeral_len: equ $ - resp_mid_ephemeral
+resp_mid_channel:     db '","payload":{"response_type":"in_channel","text":"'
+resp_mid_channel_len: equ $ - resp_mid_channel
+resp_suffix:          db '"}}'
+resp_suffix_len:      equ $ - resp_suffix
 
 section .bss
 cmd_table:  resb cmd_entry_size * MAX_CMDS
 cmd_count:  resd 1
 
 section .text
-global cmd_init, cmd_register, cmd_dispatch, slack_send_response
+global cmd_init, cmd_register, cmd_dispatch, slack_send_response, slack_send_response_ephemeral
 
 extern json_get_str
 extern ws_send_frame
@@ -412,7 +414,83 @@ cmd_dispatch:
 ;                          const char *text, uint32_t text_len)
 ; rdi = envelope_id ptr, esi = envelope_id len
 ; rdx = text ptr, ecx = text len
+; Sends response visible to everyone in the channel (in_channel)
 slack_send_response:
+    cld
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 1024
+
+    ; Save args before debug_putc clobbers them
+    mov r12, rdi
+    mov r13d, esi
+    mov r14, rdx
+    mov r15d, ecx
+
+    mov dil, 'C'
+    call debug_putc
+
+    ; Build JSON: {"envelope_id":"<id>","payload":{"response_type":"in_channel","text":"<text>"}}
+    lea rdi, [rsp]
+
+    lea rsi, [rel resp_prefix]
+    mov ecx, resp_prefix_len
+    rep movsb
+
+    mov rsi, r12
+    mov ecx, r13d
+    rep movsb
+
+    lea rsi, [rel resp_mid_channel]
+    mov ecx, resp_mid_channel_len
+    rep movsb
+
+    mov rsi, r14
+    mov ecx, r15d
+    rep movsb
+
+    lea rsi, [rel resp_suffix]
+    mov ecx, resp_suffix_len
+    rep movsb
+
+    ; Total length = rdi - rsp
+    mov rax, rdi
+    sub rax, rsp
+    mov ebx, eax
+
+    ; Debug: hex dump the response JSON
+    mov dil, 'J'
+    call debug_putc
+    lea rdi, [rsp]
+    mov esi, ebx
+    call debug_hexdump
+
+    ; Send as WS_TEXT frame
+    mov rax, [rel ws_ctx_ptr]
+    test rax, rax
+    jz .skip_send
+
+    mov rdi, rax
+    mov esi, [rel ws_fd]
+    mov edx, WS_TEXT
+    lea rcx, [rsp]
+    mov r8d, ebx
+    call ws_send_frame
+
+.skip_send:
+    add rsp, 1024
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    ret
+
+; void slack_send_response_ephemeral(const char *envelope_id, uint32_t envelope_id_len,
+;                                    const char *text, uint32_t text_len)
+; Same as slack_send_response but response is only visible to the invoking user
+slack_send_response_ephemeral:
     cld
     push r12
     push r13
@@ -440,8 +518,8 @@ slack_send_response:
     mov ecx, r13d
     rep movsb
 
-    lea rsi, [rel resp_middle]
-    mov ecx, resp_middle_len
+    lea rsi, [rel resp_mid_ephemeral]
+    mov ecx, resp_mid_ephemeral_len
     rep movsb
 
     mov rsi, r14

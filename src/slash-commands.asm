@@ -23,6 +23,7 @@ global cmd_register_all, ping_handler
 
 extern cmd_register
 extern slack_send_response
+extern slack_send_response_ephemeral
 
 ; Register all slash command handlers
 ; Call once after cmd_init()
