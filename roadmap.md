@@ -30,21 +30,29 @@
 - [x] Chunked transfer decoding (in-place, supports trailers, chunk extensions).
 - [x] HTTPS integration: full round-trip against real servers (example.com via Cloudflare, local OpenSSL).
 
-## [ ] Phase 5: Slack Integration
-- [ ] Authenticate with a Slack bot token (OAuth, `Bot-Token` header).
-- [ ] Call `apps.connections.open` to get a WebSocket URL.
-- [ ] Parse Slack's Socket Mode WebSocket events (text frames, JSON payloads).
-- [ ] Handle at least `message` events and echo a response.
-- [ ] Conform to Slack's signing secret verification if needed.
+## [x] Phase 5: Slack Integration
+- [x] Authenticate with a Slack bot token (OAuth, `Bot-Token` header).
+- [x] Call `apps.connections.open` to get a WebSocket URL.
+- [x] Parse Slack's Socket Mode WebSocket events (text frames, JSON payloads).
+- [x] Handle at least `message` events and echo a response.
+- [x] Conform to Slack's signing secret verification if needed.
 
-## [ ] Phase 6: Robustness
+## [ ] Phase 6: Commands & Responses
+- [x] Slash command registration and dispatch framework (`cmd_register`/`cmd_dispatch`).
+- [x] `/slack-asm ping` → `pong` response.
+- [x] Response routing: `slack_send_response` replies in-channel (default), `slack_send_response_ephemeral` replies to user only.
+- [ ] Additional built-in commands (help, info, etc.).
+- [ ] Event handler for `message` events (not just slash commands).
+- [ ] Thread reply support.
+
+## [ ] Phase 7: Robustness
 - [ ] Reconnect on network/TLS failure with exponential backoff.
 - [ ] Handle Slack rate limits (HTTP 429) and retry-After.
 - [ ] Graceful shutdown on SIGTERM/SIGINT.
 - [ ] Logging to stderr with timestamps.
 - [ ] ENV file configuration for tokens and secrets.
 
-## [ ] Phase 7: Polish & CI
+## [ ] Phase 8: Polish & CI
 - [x] Multi-stage Docker build (pure scratch image).
 - [x] GitHub Actions CI for `docker build`.
 - [x] Dependabot for GitHub Actions & Docker base image updates.
