@@ -8,6 +8,7 @@
 **/slack
 **/gcm_test
 **/rsa_test
+**/test_runner
 
 # Keep ASM code
 !**/*.asm
