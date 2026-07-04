@@ -18,6 +18,8 @@ struc handler_args
     .user_len      resq 1
     .envelope_id   resq 1
     .envelope_id_len resq 1
+    .thread_ts     resq 1
+    .thread_ts_len resq 1
 endstruc
 
 section .rodata
@@ -41,6 +43,8 @@ key_user:           db '"user_id"'
 key_user_len:       equ $ - key_user
 key_envelope_id:    db '"envelope_id"'
 key_envelope_id_len: equ $ - key_envelope_id
+key_thread_ts:      db '"thread_ts"'
+key_thread_ts_len:  equ $ - key_thread_ts
 
 resp_prefix:          db '{"envelope_id":"'
 resp_prefix_len:      equ $ - resp_prefix
@@ -48,6 +52,10 @@ resp_mid_ephemeral:   db '","payload":{"text":"'
 resp_mid_ephemeral_len: equ $ - resp_mid_ephemeral
 resp_mid_channel:     db '","payload":{"response_type":"in_channel","text":"'
 resp_mid_channel_len: equ $ - resp_mid_channel
+resp_mid_thread:      db '","payload":{"thread_ts":"'
+resp_mid_thread_len:  equ $ - resp_mid_thread
+resp_mid_thread_text: db '","text":"'
+resp_mid_thread_text_len: equ $ - resp_mid_thread_text
 resp_suffix:          db '"}}'
 resp_suffix_len:      equ $ - resp_suffix
 
@@ -56,7 +64,7 @@ cmd_table:  resb cmd_entry_size * MAX_CMDS
 cmd_count:  resd 1
 
 section .text
-global cmd_init, cmd_register, cmd_dispatch, slack_send_response, slack_send_response_ephemeral
+global cmd_init, cmd_register, cmd_dispatch, slack_send_response, slack_send_response_ephemeral, slack_send_response_thread
 
 extern json_get_str
 extern ws_send_frame
@@ -113,7 +121,7 @@ cmd_dispatch:
     push r14
     push r15
     push rbx
-    sub rsp, 80
+    sub rsp, 128
 
     mov r12, rdi
     mov r13d, esi
@@ -189,6 +197,15 @@ cmd_dispatch:
     call json_get_str
     mov [rsp + 64], rax
     mov [rsp + 72], edx
+
+    ; Extract thread_ts (optional, for thread replies)
+    mov rdi, r12
+    mov esi, r13d
+    lea rdx, [rel key_thread_ts]
+    mov ecx, key_thread_ts_len
+    call json_get_str
+    mov [rsp + 80], rax
+    mov [rsp + 88], edx
 
     ; Determine dispatch mode: check if command is the namespace prefix
     ; (allow JSON-escaped "\/" prefix)
@@ -402,7 +419,7 @@ cmd_dispatch:
     mov eax, 1
 
 .done:
-    add rsp, 80
+    add rsp, 128
     pop rbx
     pop r15
     pop r14
@@ -545,7 +562,7 @@ slack_send_response_ephemeral:
     ; Send as WS_TEXT frame
     mov rax, [rel ws_ctx_ptr]
     test rax, rax
-    jz .skip_send
+    jz .ep_skip
 
     mov rdi, rax
     mov esi, [rel ws_fd]
@@ -554,7 +571,98 @@ slack_send_response_ephemeral:
     mov r8d, ebx
     call ws_send_frame
 
-.skip_send:
+.ep_skip:
+    add rsp, 1024
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    ret
+
+; void slack_send_response_thread(const char *envelope_id, uint32_t envelope_id_len,
+;                                  const char *text, uint32_t text_len,
+;                                  const char *thread_ts, uint32_t thread_ts_len)
+; rdi = envelope_id ptr, esi = envelope_id_len
+; rdx = text ptr, ecx = text_len
+; r8 = thread_ts ptr, r9d = thread_ts_len
+; Sends response in a thread
+slack_send_response_thread:
+    cld
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 1024
+
+    ; Save args
+    mov r12, rdi
+    mov r13d, esi
+    mov r14, rdx
+    mov r15d, ecx
+    push r8
+    push r9
+
+    mov dil, 'T'
+    call debug_putc
+
+    ; Build JSON: {"envelope_id":"<id>","payload":{"thread_ts":"<ts>","text":"<text>"}}
+    lea rdi, [rsp]
+
+    lea rsi, [rel resp_prefix]
+    mov ecx, resp_prefix_len
+    rep movsb
+
+    mov rsi, r12
+    mov ecx, r13d
+    rep movsb
+
+    lea rsi, [rel resp_mid_thread]
+    mov ecx, resp_mid_thread_len
+    rep movsb
+
+    pop r9
+    pop r8
+    mov rsi, r8
+    mov ecx, r9d
+    rep movsb
+
+    lea rsi, [rel resp_mid_thread_text]
+    mov ecx, resp_mid_thread_text_len
+    rep movsb
+
+    mov rsi, r14
+    mov ecx, r15d
+    rep movsb
+
+    lea rsi, [rel resp_suffix]
+    mov ecx, resp_suffix_len
+    rep movsb
+
+    ; Total length = rdi - rsp
+    mov rax, rdi
+    sub rax, rsp
+    mov ebx, eax
+
+    ; Debug: hex dump the response JSON
+    mov dil, 'J'
+    call debug_putc
+    lea rdi, [rsp]
+    mov esi, ebx
+    call debug_hexdump
+
+    ; Send as WS_TEXT frame
+    mov rax, [rel ws_ctx_ptr]
+    test rax, rax
+    jz .thr_skip
+
+    mov rdi, rax
+    mov esi, [rel ws_fd]
+    mov edx, WS_TEXT
+    lea rcx, [rsp]
+    mov r8d, ebx
+    call ws_send_frame
+
+.thr_skip:
     add rsp, 1024
     pop r15
     pop r14
