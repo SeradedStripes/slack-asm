@@ -1,0 +1,14 @@
+.git
+.gitignore
+AGENTS.md
+Dockerfile
+.dockerignore
+test/
+test_runner
+rsa_test
+gcm_test
+aes_test
+httpbin_test
+*.o
+*.swp
+*.swo
