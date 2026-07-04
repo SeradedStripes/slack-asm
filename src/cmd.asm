@@ -45,6 +45,8 @@ key_envelope_id:    db '"envelope_id"'
 key_envelope_id_len: equ $ - key_envelope_id
 key_thread_ts:      db '"thread_ts"'
 key_thread_ts_len:  equ $ - key_thread_ts
+key_ts:             db '"ts"'
+key_ts_len:         equ $ - key_ts
 
 resp_prefix:          db '{"envelope_id":"'
 resp_prefix_len:      equ $ - resp_prefix
@@ -204,6 +206,17 @@ cmd_dispatch:
     lea rdx, [rel key_thread_ts]
     mov ecx, key_thread_ts_len
     call json_get_str
+    test rax, rax
+    jnz .save_ts
+
+    ; Fall back to "ts" (available on slash command invocations, message events)
+    mov rdi, r12
+    mov esi, r13d
+    lea rdx, [rel key_ts]
+    mov ecx, key_ts_len
+    call json_get_str
+
+.save_ts:
     mov [rsp + 80], rax
     mov [rsp + 88], edx
 
