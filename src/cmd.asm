@@ -22,6 +22,11 @@ struc handler_args
     .thread_ts_len resq 1
 endstruc
 
+; Channel->ts cache: fixed-size entries, zero-padded
+MAX_CACHE_ENTRIES  equ 16
+CACHE_CHAN_SZ      equ 24
+CACHE_TS_SZ        equ 24
+
 section .rodata
 str_type_slash:     db "slash_commands"
 str_type_slash_len: equ $ - str_type_slash
@@ -48,13 +53,18 @@ key_thread_ts_len:  equ $ - key_thread_ts
 key_ts:             db '"ts"'
 key_ts_len:         equ $ - key_ts
 
+event_callback_str: db "event_callback"
+event_callback_len: equ $ - event_callback_str
+key_events_channel: db '"channel"'
+key_events_channel_len: equ $ - key_events_channel
+
 resp_prefix:          db '{"envelope_id":"'
 resp_prefix_len:      equ $ - resp_prefix
 resp_mid_ephemeral:   db '","payload":{"text":"'
 resp_mid_ephemeral_len: equ $ - resp_mid_ephemeral
 resp_mid_channel:     db '","payload":{"response_type":"in_channel","text":"'
 resp_mid_channel_len: equ $ - resp_mid_channel
-resp_mid_thread:      db '","payload":{"thread_ts":"'
+resp_mid_thread:      db '","payload":{"response_type":"in_channel","thread_ts":"'
 resp_mid_thread_len:  equ $ - resp_mid_thread
 resp_mid_thread_text: db '","text":"'
 resp_mid_thread_text_len: equ $ - resp_mid_thread_text
@@ -62,8 +72,12 @@ resp_suffix:          db '"}}'
 resp_suffix_len:      equ $ - resp_suffix
 
 section .bss
-cmd_table:  resb cmd_entry_size * MAX_CMDS
-cmd_count:  resd 1
+cmd_table:       resb cmd_entry_size * MAX_CMDS
+cmd_count:       resd 1
+
+chan_cache_chan: resb MAX_CACHE_ENTRIES * CACHE_CHAN_SZ
+chan_cache_ts:   resb MAX_CACHE_ENTRIES * CACHE_TS_SZ
+chan_cache_used: resd 1
 
 section .text
 global cmd_init, cmd_register, cmd_dispatch, slack_send_response, slack_send_response_ephemeral, slack_send_response_thread
@@ -137,6 +151,11 @@ cmd_dispatch:
     test rax, rax
     jz .not_cmd
 
+    ; Check if it's an events_api event (type: "event_callback")
+    cmp edx, event_callback_len
+    je .check_event_callback
+
+    ; Check if it's a slash_commands event
     cmp edx, str_type_slash_len
     jne .not_cmd
 
@@ -150,8 +169,142 @@ cmd_dispatch:
     pop rdi
     pop rsi
     jne .not_cmd
+    jmp .handle_slash
 
-    ; Extract command name
+.check_event_callback:
+    push rsi
+    push rdi
+    mov rsi, rax
+    lea rdi, [rel event_callback_str]
+    mov ecx, event_callback_len
+    cld
+    repe cmpsb
+    pop rdi
+    pop rsi
+    jne .not_cmd
+
+    ; ---- events_api message event: cache channel+ts for thread replies ----
+    ; Extract "channel" from event
+    mov rdi, r12
+    mov esi, r13d
+    lea rdx, [rel key_events_channel]
+    mov ecx, key_events_channel_len
+    call json_get_str
+    test rax, rax
+    jz .not_cmd
+    mov [rsp + 96], rax
+    mov [rsp + 104], edx
+
+    ; Extract "ts" from event
+    mov rdi, r12
+    mov esi, r13d
+    lea rdx, [rel key_ts]
+    mov ecx, key_ts_len
+    call json_get_str
+    test rax, rax
+    jz .not_cmd
+    mov [rsp + 112], rax
+    mov [rsp + 120], edx
+
+    ; Look for existing cache entry for this channel
+    xor r14d, r14d
+    mov r15d, [rel chan_cache_used]
+    test r15d, r15d
+    jz .cache_add_new
+
+.cache_find_loop:
+    cmp r14d, r15d
+    jae .cache_add_new
+
+    mov eax, r14d
+    mov ecx, CACHE_CHAN_SZ
+    mul ecx
+    lea rbx, [rel chan_cache_chan]
+    add rbx, rax
+
+    ; Compare channel (exact match of channel_len bytes)
+    mov rdi, [rsp + 96]
+    mov rsi, rbx
+    mov ecx, [rsp + 104]
+    cmp ecx, CACHE_CHAN_SZ
+    ja .cache_next
+    cld
+    repe cmpsb
+    jne .cache_next
+
+    ; Check that cached string ends at channel_len
+    mov eax, [rsp + 104]
+    cmp byte [rbx + rax], 0
+    jne .cache_next
+
+    ; Found – update ts in this entry (zero then copy)
+    mov eax, r14d
+    mov ecx, CACHE_TS_SZ
+    mul ecx
+    lea rdi, [rel chan_cache_ts]
+    add rdi, rax
+    mov ebp, eax
+    xor eax, eax
+    mov ecx, CACHE_TS_SZ
+    rep stosb
+    lea rdi, [rel chan_cache_ts]
+    add rdi, rbp
+    mov rsi, [rsp + 112]
+    mov ecx, [rsp + 120]
+    cmp ecx, CACHE_TS_SZ
+    jbe .cache_copy_upd
+    mov ecx, CACHE_TS_SZ
+.cache_copy_upd:
+    cld
+    rep movsb
+    xor eax, eax
+    jmp .done_events
+
+.cache_next:
+    inc r14d
+    jmp .cache_find_loop
+
+.cache_add_new:
+    cmp r15d, MAX_CACHE_ENTRIES
+    jae .done_events
+
+    ; Copy channel into new entry (BSS is already zeroed)
+    mov eax, r15d
+    mov ecx, CACHE_CHAN_SZ
+    mul ecx
+    lea rdi, [rel chan_cache_chan]
+    add rdi, rax
+    mov rsi, [rsp + 96]
+    mov ecx, [rsp + 104]
+    cmp ecx, CACHE_CHAN_SZ
+    jbe .cache_copy_chan
+    mov ecx, CACHE_CHAN_SZ
+.cache_copy_chan:
+    cld
+    rep movsb
+
+    ; Copy ts into new entry
+    mov eax, r15d
+    mov ecx, CACHE_TS_SZ
+    mul ecx
+    lea rdi, [rel chan_cache_ts]
+    add rdi, rax
+    mov rsi, [rsp + 112]
+    mov ecx, [rsp + 120]
+    cmp ecx, CACHE_TS_SZ
+    jbe .cache_copy_ts
+    mov ecx, CACHE_TS_SZ
+.cache_copy_ts:
+    cld
+    rep movsb
+
+    inc dword [rel chan_cache_used]
+
+.done_events:
+    xor eax, eax
+    jmp .done
+
+.handle_slash:
     mov rdi, r12
     mov esi, r13d
     lea rdx, [rel key_command]
@@ -182,6 +335,65 @@ cmd_dispatch:
     mov [rsp + 32], rax
     mov [rsp + 40], edx
 
+    ; Look up cached ts for this channel (for thread replies)
+    xor eax, eax
+    mov [rsp + 80], rax          ; thread_ts ptr (default NULL)
+    mov [rsp + 88], eax          ; thread_ts len (default 0)
+    mov r14d, [rel chan_cache_used]
+    test r14d, r14d
+    jz .extract_user
+
+    xor r15d, r15d
+.ts_lookup_loop:
+    cmp r15d, r14d
+    jae .extract_user
+
+    mov eax, r15d
+    mov ecx, CACHE_CHAN_SZ
+    mul ecx
+    lea rbx, [rel chan_cache_chan]
+    add rbx, rax
+
+    mov rdi, [rsp + 32]
+    mov esi, [rsp + 40]
+    cmp esi, CACHE_CHAN_SZ
+    ja .ts_lookup_next
+    mov rdi, [rsp + 32]
+    mov rsi, rbx
+    mov ecx, [rsp + 40]
+    cld
+    repe cmpsb
+    jne .ts_lookup_next
+
+    mov edi, [rsp + 40]
+    cmp byte [rbx + rdi], 0
+    jne .ts_lookup_next
+
+    ; Found cache entry, set thread_ts
+    mov eax, r15d
+    mov ecx, CACHE_TS_SZ
+    mul ecx
+    lea rbx, [rel chan_cache_ts]
+    add rbx, rax
+    mov [rsp + 80], rbx
+
+    xor edx, edx
+.ts_scan_len:
+    cmp edx, CACHE_TS_SZ
+    jae .ts_len_done
+    cmp byte [rbx + rdx], 0
+    je .ts_len_done
+    inc edx
+    jmp .ts_scan_len
+.ts_len_done:
+    mov [rsp + 88], edx
+    jmp .extract_user
+
+.ts_lookup_next:
+    inc r15d
+    jmp .ts_lookup_loop
+
+.extract_user:
     ; Extract user_id (optional)
     mov rdi, r12
     mov esi, r13d
@@ -200,26 +412,7 @@ cmd_dispatch:
     mov [rsp + 64], rax
     mov [rsp + 72], edx
 
-    ; Extract thread_ts (optional, for thread replies)
-    mov rdi, r12
-    mov esi, r13d
-    lea rdx, [rel key_thread_ts]
-    mov ecx, key_thread_ts_len
-    call json_get_str
-    test rax, rax
-    jnz .save_ts
-
-    ; Fall back to "ts" (available on slash command invocations, message events)
-    mov rdi, r12
-    mov esi, r13d
-    lea rdx, [rel key_ts]
-    mov ecx, key_ts_len
-    call json_get_str
-
-.save_ts:
-    mov [rsp + 80], rax
-    mov [rsp + 88], edx
-
+    ; thread_ts set from cache above (or NULL if no cached message ts)
     ; Determine dispatch mode: check if command is the namespace prefix
     ; (allow JSON-escaped "\/" prefix)
     mov eax, [rsp + 8]
