@@ -139,6 +139,51 @@ json_get_str:
     pop r12
     ret
 
+; int memmem(const char *buf, uint32_t buflen, const char *needle, uint32_t needlelen)
+; Returns 1 if needle found, 0 otherwise. Clobbers rdi, rsi, rcx, rax, rdx.
+global memmem
+memmem:
+    test ecx, ecx
+    jz .mm_no
+    sub esi, ecx
+    jb .mm_no
+    inc esi
+    mov r8, rdi
+    xor r9d, r9d
+.mm_outer:
+    cmp r9d, esi
+    jae .mm_no
+    mov al, [rdx]
+.mm_scan:
+    cmp r9d, esi
+    jae .mm_no
+    cmp al, [r8 + r9]
+    je .mm_try
+    inc r9d
+    jmp .mm_scan
+.mm_try:
+    push rcx
+    push rdi
+    push rsi
+    push rdx
+    lea rdi, [r8 + r9]
+    mov rsi, rdx
+    cld
+    repe cmpsb
+    pop rdx
+    pop rsi
+    pop rdi
+    pop rcx
+    je .mm_yes
+    inc r9d
+    jmp .mm_outer
+.mm_yes:
+    mov eax, 1
+    ret
+.mm_no:
+    xor eax, eax
+    ret
+
 ; Base64 encode binary data (RFC 4648)
 ; rdi = input, rsi = input_len, rdx = output buffer
 ; Returns rax = encoded length

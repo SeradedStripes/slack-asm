@@ -92,6 +92,10 @@ server_finished_label: db "server finished"
 server_finished_label_len: equ $ - server_finished_label
 ext_master_label:     db "extended master secret"
 ext_master_label_len: equ $ - ext_master_label
+debug_label_post_fin: db "==="
+debug_label_recv_a: db "AAA"
+debug_label_recv_b: db "BBB"
+debug_label_recv_c: db "CCC"
 
 section .bss
 header_buf:  resb TLS_HEADER_SIZE
@@ -571,6 +575,19 @@ tls_recv:
     test rax, rax
     js .recv_error_read
 
+    ; DEBUG: post-header-read
+    push rax
+    push rdi
+    push rsi
+    push rcx
+    lea rdi, [debug_label_recv_a]
+    mov esi, 3
+    call debug_hexdump
+    pop rcx
+    pop rsi
+    pop rdi
+    pop rax
+
     ; Parse header
     ; content type
     movzx eax, byte [rbx]
@@ -587,6 +604,19 @@ tls_recv:
     cmp r12d, TLS_MAX_PAYLOAD + 256
     ja .recv_error_bad_length
 
+    ; DEBUG: post-parse-header
+    push rax
+    push rdi
+    push rsi
+    push rcx
+    lea rdi, [debug_label_recv_b]
+    mov esi, 3
+    call debug_hexdump
+    pop rcx
+    pop rsi
+    pop rdi
+    pop rax
+
     ; Check if server has sent CCS (encryption active on receive)
     cmp byte [rbp + tls_ctx.server_ccs], 1
     je .recv_encrypted
@@ -598,6 +628,19 @@ tls_recv:
     call _read_exactly
     test rax, rax
     js .recv_error_read
+
+    ; DEBUG: post-payload-read
+    push rax
+    push rdi
+    push rsi
+    push rcx
+    lea rdi, [debug_label_recv_c]
+    mov esi, 3
+    call debug_hexdump
+    pop rcx
+    pop rsi
+    pop rdi
+    pop rax
 
     ; out_len ptr
     mov rax, [rsp]
@@ -1524,16 +1567,55 @@ tls_client_start:
     test rax, rax
     js .tcs_error
 
+    ; DEBUG: mark post-Finished-send
+    push rax
+    push rdi
+    push rsi
+    push rcx
+    lea rdi, [debug_label_post_fin]
+    mov esi, 3
+    call debug_hexdump
+    pop rcx
+    pop rsi
+    pop rdi
+    pop rax
+
     ; Finalize transcript → tls_digest (server Finished digest)
     lea rdi, [tls_sha256_ctx]
     lea rsi, [tls_digest]
     call sha256_final
+
+    ; DEBUG: mark post-finalize
+    push rax
+    push rdi
+    push rsi
+    push rcx
+    lea rdi, [debug_label_post_fin]
+    mov esi, 3
+    call debug_hexdump
+    pop rcx
+    pop rsi
+    pop rdi
+    pop rax
 
     ; Receive server Finished (may be preceded by post-handshake messages)
     xor eax, eax
     mov [rsp + 16], eax        ; pending_len = 0
 
 .tcs_recv_finished:
+    ; DEBUG: mark pre-recv
+    push rax
+    push rdi
+    push rsi
+    push rcx
+    lea rdi, [debug_label_post_fin]
+    mov esi, 3
+    call debug_hexdump
+    pop rcx
+    pop rsi
+    pop rdi
+    pop rax
+
     mov rdi, r12
     mov esi, r13d
     lea rdx, [rsp + 8]
@@ -1582,20 +1664,62 @@ tls_client_start:
     call tls_prf
     add rsp, 16
 
+    ; DEBUG: post-prf
+    push rax
+    push rdi
+    push rsi
+    push rcx
+    lea rdi, [debug_label_recv_a]
+    mov esi, 3
+    call debug_hexdump
+    pop rcx
+    pop rsi
+    pop rdi
+    pop rax
+
     ; Compare expected (hs_buf+48) with received (hs_buf+4)
     lea rsi, [hs_buf + 48]
     lea rdi, [hs_buf + 4]
     mov ecx, 12
     cld
+    
+    ; DEBUG: marker before cmpsb
+    push rax
+    push rdi
+    push rsi
+    push rcx
+    lea rdi, [debug_label_recv_b]
+    mov esi, 3
+    call debug_hexdump
+    pop rcx
+    pop rsi
+    pop rdi
+    pop rax
+    
     repe cmpsb
     jnz .tcs_verify_fail
+    
+    ; DEBUG: post-verify
+    push rax
+    push rdi
+    push rsi
+    push rcx
+    lea rdi, [debug_label_recv_c]
+    mov esi, 3
+    call debug_hexdump
+    pop rcx
+    pop rsi
+    pop rdi
+    pop rax
+    
     xor eax, eax
     jmp .tcs_return
 
 .tcs_save_pending:
     mov r8d, [rsp]
     lea rdi, [hs_buf + 3000]
-    add rdi, [rsp + 16]
+    mov edx, [rsp + 16]
+    add rdi, rdx
     lea rsi, [hs_buf]
     mov ecx, r8d
     cld
@@ -1969,6 +2093,19 @@ tls_prf:
     lea r8, [rel prf_abuf]
     call hmac_sha256
 
+    ; DEBUG: post-hmac-A1
+    push rax
+    push rdi
+    push rsi
+    push rcx
+    lea rdi, [debug_label_recv_a]
+    mov esi, 3
+    call debug_hexdump
+    pop rcx
+    pop rsi
+    pop rdi
+    pop rax
+
     ; DEBUG: dump A(1) and seed_buf
     push r14
     push r15
@@ -1985,6 +2122,19 @@ tls_prf:
     call debug_hexdump
     pop r15
     pop r14
+
+    ; DEBUG: pre-loop
+    push rax
+    push rdi
+    push rsi
+    push rcx
+    lea rdi, [debug_label_recv_a]
+    mov esi, 3
+    call debug_hexdump
+    pop rcx
+    pop rsi
+    pop rdi
+    pop rax
 
     ; Main P_SHA256 loop
     ; output pointer

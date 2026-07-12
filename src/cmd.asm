@@ -15,11 +15,14 @@ struc cmd_entry
 endstruc
 
 struc handler_args
-    .user_len      resq 1
-    .envelope_id   resq 1
+    .channel_id      resq 1
+    .channel_id_len  resq 1
+    .user_id_ptr     resq 1
+    .user_id_len     resq 1
+    .envelope_id     resq 1
     .envelope_id_len resq 1
-    .thread_ts     resq 1
-    .thread_ts_len resq 1
+    .thread_ts       resq 1
+    .thread_ts_len   resq 1
 endstruc
 
 ; Channel->ts cache: fixed-size entries, zero-padded
@@ -48,6 +51,8 @@ key_user:           db '"user_id"'
 key_user_len:       equ $ - key_user
 key_envelope_id:    db '"envelope_id"'
 key_envelope_id_len: equ $ - key_envelope_id
+key_response_url:   db '"response_url"'
+key_response_url_len: equ $ - key_response_url
 key_thread_ts:      db '"thread_ts"'
 key_thread_ts_len:  equ $ - key_thread_ts
 key_ts:             db '"ts"'
@@ -70,6 +75,8 @@ resp_mid_thread_text: db '","text":"'
 resp_mid_thread_text_len: equ $ - resp_mid_thread_text
 resp_suffix:          db '"}}'
 resp_suffix_len:      equ $ - resp_suffix
+ack_suffix:           db '"}'
+ack_suffix_len:       equ $ - ack_suffix
 
 section .bss
 cmd_table:       resb cmd_entry_size * MAX_CMDS
@@ -80,13 +87,15 @@ chan_cache_ts:   resb MAX_CACHE_ENTRIES * CACHE_TS_SZ
 chan_cache_used: resd 1
 
 section .text
-global cmd_init, cmd_register, cmd_dispatch, slack_send_response, slack_send_response_ephemeral, slack_send_response_thread
+global cmd_init, cmd_register, cmd_dispatch, slack_send_response, slack_send_response_ephemeral, slack_send_response_thread, slack_send_ack
 
 extern json_get_str
 extern ws_send_frame
 extern ws_ctx_ptr, ws_fd
 extern debug_putc
 extern debug_hexdump
+extern memmem
+extern slack_fetch_channel_ts, fallback_ts
 
 ; void cmd_init(void)
 cmd_init:
@@ -142,7 +151,18 @@ cmd_dispatch:
     mov r12, rdi
     mov r13d, esi
 
-    ; Check type field
+    ; CHeck if this is an event_callback (events_api).
+    ; Use memmem because json_get_str("type") returns the FIRST "type",
+    ; which for events_api is "message" (inside the event object).
+    mov rdi, r12
+    mov esi, r13d
+    lea rdx, [rel event_callback_str]
+    mov ecx, event_callback_len
+    call memmem
+    test eax, eax
+    jnz .handle_events
+
+    ; Check for slash_commands
     mov rdi, r12
     mov esi, r13d
     lea rdx, [rel key_type]
@@ -151,14 +171,8 @@ cmd_dispatch:
     test rax, rax
     jz .not_cmd
 
-    ; Check if it's an events_api event (type: "event_callback")
-    cmp edx, event_callback_len
-    je .check_event_callback
-
-    ; Check if it's a slash_commands event
     cmp edx, str_type_slash_len
     jne .not_cmd
-
     push rsi
     push rdi
     mov rsi, rax
@@ -169,21 +183,18 @@ cmd_dispatch:
     pop rdi
     pop rsi
     jne .not_cmd
-    jmp .handle_slash
-
-.check_event_callback:
-    push rsi
+    jmp near .handle_slash
+.handle_events:
+    ; events_api message event: cache channel+ts for thread replies
     push rdi
-    mov rsi, rax
-    lea rdi, [rel event_callback_str]
-    mov ecx, event_callback_len
-    cld
-    repe cmpsb
-    pop rdi
+    push rsi
+    mov dil, 'E'
+    call debug_putc
+    mov dil, 'v'
+    call debug_putc
     pop rsi
-    jne .not_cmd
+    pop rdi
 
-    ; ---- events_api message event: cache channel+ts for thread replies ----
     ; Extract "channel" from event
     mov rdi, r12
     mov esi, r13d
@@ -192,8 +203,15 @@ cmd_dispatch:
     call json_get_str
     test rax, rax
     jz .not_cmd
+
     mov [rsp + 96], rax
     mov [rsp + 104], edx
+    push rdi
+    push rsi
+    mov dil, 'c'
+    call debug_putc
+    pop rsi
+    pop rdi
 
     ; Extract "ts" from event
     mov rdi, r12
@@ -205,6 +223,12 @@ cmd_dispatch:
     jz .not_cmd
     mov [rsp + 112], rax
     mov [rsp + 120], edx
+    push rdi
+    push rsi
+    mov dil, 't'
+    call debug_putc
+    pop rsi
+    pop rdi
 
     ; Look for existing cache entry for this channel
     xor r14d, r14d
@@ -299,6 +323,12 @@ cmd_dispatch:
     rep movsb
 
     inc dword [rel chan_cache_used]
+    push rdi
+    push rsi
+    mov dil, '+'
+    call debug_putc
+    pop rsi
+    pop rdi
 
 .done_events:
     xor eax, eax
@@ -387,6 +417,14 @@ cmd_dispatch:
     jmp .ts_scan_len
 .ts_len_done:
     mov [rsp + 88], edx
+    push rdi
+    push rsi
+    mov dil, 't'
+    call debug_putc
+    mov dil, 'h'
+    call debug_putc
+    pop rsi
+    pop rdi
     jmp .extract_user
 
 .ts_lookup_next:
@@ -394,6 +432,37 @@ cmd_dispatch:
     jmp .ts_lookup_loop
 
 .extract_user:
+    ; If thread_ts is still NULL, try API fallback
+    cmp qword [rsp + 80], 0
+    jne .skip_ts_fallback
+    push rdi
+    push rsi
+    mov dil, '['
+    call debug_putc
+    pop rsi
+    pop rdi
+    push r12
+    push r13
+    mov rdi, [rsp + 48]          ; channel_id ptr (shifted by pushes)
+    mov esi, [rsp + 56]          ; channel_id len
+    call slack_fetch_channel_ts
+    test eax, eax
+    jz .ts_fallback_done
+    lea rbx, [rel fallback_ts]
+    mov [rsp + 96], rbx          ; thread_ts ptr (shifted by 2 pushes)
+    mov [rsp + 104], eax         ; thread_ts len
+    push rdi
+    push rsi
+    mov dil, 't'
+    call debug_putc
+    mov dil, 's'
+    call debug_putc
+    pop rsi
+    pop rdi
+.ts_fallback_done:
+    pop r13
+    pop r12
+.skip_ts_fallback:
     ; Extract user_id (optional)
     mov rdi, r12
     mov esi, r13d
@@ -411,6 +480,15 @@ cmd_dispatch:
     call json_get_str
     mov [rsp + 64], rax
     mov [rsp + 72], edx
+
+    ; Extract response_url (for async threaded replies)
+    mov rdi, r12
+    mov esi, r13d
+    lea rdx, [rel key_response_url]
+    mov ecx, key_response_url_len
+    call json_get_str
+    mov [rsp + 96], rax
+    mov [rsp + 104], edx
 
     ; thread_ts set from cache above (or NULL if no cached message ts)
     ; Determine dispatch mode: check if command is the namespace prefix
@@ -529,8 +607,8 @@ cmd_dispatch:
     mov dil, 'g'
     call debug_putc
 
-    ; Push pointer to handler_args struct (user_len, envelope_id, envelope_id_len)
-    lea rax, [rsp + 56]
+    ; Push pointer to handler_args struct (channel_id, channel_id_len, ...)
+    lea rax, [rsp + 32]
     push rax
 
     mov dil, 'h'
@@ -598,7 +676,7 @@ cmd_dispatch:
     jmp .dir_loop
 
 .dir_found:
-    lea rax, [rsp + 56]
+    lea rax, [rsp + 32]
     push rax
 
     mov rdi, [rsp + 8]
@@ -800,19 +878,19 @@ slack_send_response_thread:
     push r15
     sub rsp, 1024
 
-    ; Save args
+    ; Save args, use buffer area (avoid push after sub rsp)
     mov r12, rdi
     mov r13d, esi
     mov r14, rdx
     mov r15d, ecx
-    push r8
-    push r9
+    mov [rsp], r8          ; thread_ts ptr
+    mov [rsp + 8], r9      ; thread_ts len
 
     mov dil, 'T'
     call debug_putc
 
     ; Build JSON: {"envelope_id":"<id>","payload":{"thread_ts":"<ts>","text":"<text>"}}
-    lea rdi, [rsp]
+    lea rdi, [rsp + 16]
 
     lea rsi, [rel resp_prefix]
     mov ecx, resp_prefix_len
@@ -826,10 +904,8 @@ slack_send_response_thread:
     mov ecx, resp_mid_thread_len
     rep movsb
 
-    pop r9
-    pop r8
-    mov rsi, r8
-    mov ecx, r9d
+    mov rsi, [rsp]         ; thread_ts ptr
+    mov ecx, [rsp + 8]     ; thread_ts len
     rep movsb
 
     lea rsi, [rel resp_mid_thread_text]
@@ -844,15 +920,15 @@ slack_send_response_thread:
     mov ecx, resp_suffix_len
     rep movsb
 
-    ; Total length = rdi - rsp
-    mov rax, rdi
-    sub rax, rsp
-    mov ebx, eax
+    ; Total length = rdi - (rsp + 16)
+    lea rax, [rsp + 16]
+    sub rdi, rax
+    mov ebx, edi
 
     ; Debug: hex dump the response JSON
     mov dil, 'J'
     call debug_putc
-    lea rdi, [rsp]
+    lea rdi, [rsp + 16]
     mov esi, ebx
     call debug_hexdump
 
@@ -864,11 +940,66 @@ slack_send_response_thread:
     mov rdi, rax
     mov esi, [rel ws_fd]
     mov edx, WS_TEXT
-    lea rcx, [rsp]
+    lea rcx, [rsp + 16]
     mov r8d, ebx
     call ws_send_frame
 
 .thr_skip:
+    add rsp, 1024
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    ret
+
+; void slack_send_ack(const char *envelope_id, uint32_t envelope_id_len)
+; Sends just {"envelope_id":"<id>"} via WS (minimal Socket Mode ack)
+slack_send_ack:
+    cld
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 1024
+
+    mov r12, rdi
+    mov r13d, esi
+
+    ; Build JSON: {"envelope_id":"<id>"}
+    lea rdi, [rsp]
+    lea rsi, [rel resp_prefix]
+    mov ecx, resp_prefix_len
+    rep movsb
+    mov rsi, r12
+    mov ecx, r13d
+    rep movsb
+    lea rsi, [rel ack_suffix]
+    mov ecx, ack_suffix_len
+    rep movsb
+
+    mov rax, rdi
+    sub rax, rsp
+    mov ebx, eax
+
+    mov dil, 'A'
+    call debug_putc
+    lea rdi, [rsp]
+    mov esi, ebx
+    call debug_hexdump
+
+    ; Send as WS_TEXT frame
+    mov rax, [rel ws_ctx_ptr]
+    test rax, rax
+    jz .ack_skip
+
+    mov rdi, rax
+    mov esi, [rel ws_fd]
+    mov edx, WS_TEXT
+    lea rcx, [rsp]
+    mov r8d, ebx
+    call ws_send_frame
+
+.ack_skip:
     add rsp, 1024
     pop r15
     pop r14
