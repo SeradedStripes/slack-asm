@@ -23,13 +23,19 @@ str_ping:           db "ping"
 str_ping_len:       equ $ - str_ping
 str_help:           db "help"
 str_help_len:       equ $ - str_help
+str_meow:           db "meow"
+str_meow_len:       equ $ - str_meow
 
 msg_pong:           db "pong"
 msg_pong_len:       equ $ - msg_pong
 
+msg_meow:           db "meoww"
+msg_meow_len:       equ $ - msg_meow
+
 msg_help_text:      db "Available commands:", 0x0A
                     db "/slack-asm help - Displays this help message.", 0x0A
                     db "/slack-asm ping - Returns 'pong' in response.", 0x0A
+                    db "/slack-asm meow - Returns 'meoww' in response.", 0x0A
 msg_help_text_len:  equ $ - msg_help_text
 
 resp_url_prefix:  db '{"response_type":"in_channel","thread_ts":"'
@@ -51,7 +57,7 @@ cpm_suffix:      db '"}'
 cpm_suffix_len:  equ $ - cpm_suffix
 
 section .text
-global cmd_register_all, ping_handler, help_handler
+global cmd_register_all, ping_handler, help_handler, meow_handler
 
 extern cmd_register
 extern slack_send_response
@@ -79,6 +85,12 @@ cmd_register_all:
     mov ecx, CMD_NAMESPACED
     call cmd_register
 
+    lea rdi, [rel str_meow]
+    mov esi, str_meow_len
+    lea rdx, [rel meow_handler]
+    mov ecx, CMD_NAMESPACED
+    call cmd_register
+
     pop rbx
     ret
 
@@ -94,6 +106,22 @@ ping_handler:
     mov esi, [r10 + handler_args.envelope_id_len]
     lea rdx, [rel msg_pong]
     mov ecx, msg_pong_len
+    call slack_send_response
+
+    pop r12
+    pop rbx
+    ret
+
+meow_handler:
+    mov r10, [rsp + 8]      ; handler_args ptr
+
+    push rbx
+    push r12
+
+    mov rdi, [r10 + handler_args.envelope_id]
+    mov esi, [r10 + handler_args.envelope_id_len]
+    lea rdx, [rel msg_meow]
+    mov ecx, msg_meow_len
     call slack_send_response
 
     pop r12
