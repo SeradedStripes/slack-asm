@@ -1,9 +1,15 @@
 services:
   app:
-    build: .
-    image: slack-asm
+    image: ghcr.io/seradedstripes/slack-asm
     volumes:
       - ./.env:/.env:ro
+    networks:
+      - slack-asm
+
+  watchtower:
+    image: containrrr/watchtower
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
     networks:
       - slack-asm
 
