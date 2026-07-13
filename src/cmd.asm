@@ -62,6 +62,10 @@ event_callback_str: db "event_callback"
 event_callback_len: equ $ - event_callback_str
 key_events_channel: db '"channel"'
 key_events_channel_len: equ $ - key_events_channel
+key_event_user:      db '"user"'
+key_event_user_len:  equ $ - key_event_user
+needle_user_id_key:  db '"user_id":"'
+needle_user_id_key_len: equ $ - needle_user_id_key
 
 resp_prefix:          db '{"envelope_id":"'
 resp_prefix_len:      equ $ - resp_prefix
@@ -85,6 +89,9 @@ cmd_count:       resd 1
 chan_cache_chan: resb MAX_CACHE_ENTRIES * CACHE_CHAN_SZ
 chan_cache_ts:   resb MAX_CACHE_ENTRIES * CACHE_TS_SZ
 chan_cache_used: resd 1
+
+dup_ts_buf:   resb 4 * 24    ; 4 recent event ts strings (for dedup)
+dup_ts_count: resd 1
 
 section .text
 global cmd_init, cmd_register, cmd_dispatch, slack_send_response, slack_send_response_ephemeral, slack_send_response_thread, slack_send_ack
@@ -331,6 +338,328 @@ cmd_dispatch:
     pop rdi
 
 .done_events:
+    ; ---- Bot mention detection (@slack-asm) ----
+    push rax
+    push rdx
+    push rdi
+    push rsi
+    mov dil, '>'
+    call debug_putc
+    pop rsi
+    pop rdi
+    pop rdx
+    pop rax
+    ; Extract "text" from event
+    mov rdi, r12
+    mov esi, r13d
+    lea rdx, [rel key_text]
+    mov ecx, key_text_len
+    call json_get_str
+    test rax, rax
+    jz .events_done
+    cmp edx, 3
+    jb .events_done
+    cmp byte [rax], '<'
+    jne .events_done
+    cmp byte [rax + 1], '@'
+    jne .events_done
+
+    push rax
+    push rdx
+    push rdi
+    push rsi
+    mov dil, '@'
+    call debug_putc
+    pop rsi
+    pop rdi
+    pop rdx
+    pop rax
+
+    ; Save pointer to mentioned user ID (after <@)
+    lea r14, [rax + 2]
+
+    ; Find closing '>' in mention
+    xor ecx, ecx
+.at_find_gt:
+    cmp ecx, edx
+    jae .events_done
+    cmp byte [rax + rcx], '>'
+    je .at_gt_found
+    inc ecx
+    jmp .at_find_gt
+.at_gt_found:
+    lea ebp, [ecx - 2]      ; ebp = mentioned user ID length
+    inc ecx
+    cmp ecx, edx
+    jae .events_done
+    cmp byte [rax + rcx], ' '
+    jne .events_done
+    inc ecx
+    add rax, rcx
+    sub edx, ecx
+
+    push rax
+    push rdx
+    push rdi
+    push rsi
+    mov dil, '!'
+    call debug_putc
+    pop rsi
+    pop rdi
+    pop rdx
+    pop rax
+
+    ; rax = command text start, edx = remaining length
+    ; Parse first word as command name
+    xor ebx, ebx
+    mov r9, rax             ; save command text ptr
+    mov r8d, edx            ; save remaining length
+.at_scan_cmd:
+    cmp ebx, r8d
+    jae .at_parsed
+    cmp byte [r9 + rbx], ' '
+    je .at_parsed
+    inc ebx
+    jmp .at_scan_cmd
+.at_parsed:
+    test ebx, ebx
+    jz .events_done
+
+    push rax
+    push rdx
+    push rdi
+    push rsi
+    mov dil, '^'
+    call debug_putc
+    pop rsi
+    pop rdi
+    pop rdx
+    pop rax
+    ; Save command info and mentioned user ID
+    mov [rsp], r9           ; command text ptr
+    mov [rsp + 8], ebx      ; command name length
+    mov [rsp + 12], r8d     ; remaining text length
+    mov rdi, r12
+    mov esi, r13d
+    lea rdx, [rel key_event_user]
+    mov ecx, key_event_user_len
+    call json_get_str
+    mov [rsp + 48], rax     ; handler_args.user_id_ptr
+    mov [rsp + 56], edx     ; handler_args.user_id_len
+
+    ; Extract envelope_id from top level
+    mov rdi, r12
+    mov esi, r13d
+    lea rdx, [rel key_envelope_id]
+    mov ecx, key_envelope_id_len
+    call json_get_str
+    mov [rsp + 64], rax     ; handler_args.envelope_id
+    mov [rsp + 72], edx     ; handler_args.envelope_id_len
+
+    push rax
+    push rdx
+    push rdi
+    push rsi
+    mov dil, '&'
+    call debug_putc
+    pop rsi
+    pop rdi
+    pop rdx
+    pop rax
+
+    ; Restore command info
+    mov r9, [rsp]           ; command text ptr
+    mov ebx, [rsp + 8]      ; command name length
+    mov r8d, [rsp + 12]     ; remaining text length
+
+    ; Set up handler_args channel_id from cache
+    mov rax, [rsp + 96]
+    mov [rsp + 32], rax     ; handler_args.channel_id
+    mov eax, [rsp + 104]
+    mov [rsp + 40], eax     ; handler_args.channel_id_len
+
+    ; thread_ts = event's ts (from cache)
+    mov rax, [rsp + 112]
+    mov [rsp + 80], rax     ; handler_args.thread_ts
+    mov eax, [rsp + 120]
+    mov [rsp + 88], eax     ; handler_args.thread_ts_len
+
+    ; response_url = NULL
+    xor eax, eax
+    mov [rsp + 96], rax
+    mov [rsp + 104], eax
+
+    ; ---- Dedup: skip if ts already processed ----
+    mov r12, [rsp + 112]       ; ts ptr
+    mov r13d, [rsp + 120]      ; ts len
+    test r12, r12
+    jz .cmd_lookup
+    test r13d, r13d
+    jz .cmd_lookup
+    cmp r13d, 20
+    ja .cmd_lookup
+
+    push rax
+    push rdx
+    push rdi
+    push rsi
+    mov dil, 'z'
+    call debug_putc
+    pop rsi
+    pop rdi
+    pop rdx
+    pop rax
+
+    xor r14d, r14d
+    mov r15d, [rel dup_ts_count]
+    cmp r15d, 4
+    jbe .dedup_ok
+    mov r15d, 4
+.dedup_ok:
+
+.dedup_loop:
+    cmp r14d, r15d
+    jae .dedup_store
+    mov eax, r14d
+    mov ecx, 24
+    mul ecx
+    lea r8, [dup_ts_buf + rax]
+    cmp r13d, [r8]            ; compare lengths first
+    jne .dedup_next
+    mov rdi, r12
+    lea rsi, [r8 + 4]
+    mov ecx, r13d
+    cld
+    repe cmpsb
+    je .dedup_skip
+
+.dedup_next:
+    inc r14d
+    jmp .dedup_loop
+
+.dedup_store:
+    push rax
+    push rdx
+    push rdi
+    push rsi
+    mov dil, 'n'
+    call debug_putc
+    pop rsi
+    pop rdi
+    pop rdx
+    pop rax
+    mov eax, [rel dup_ts_count]
+    cmp eax, 4
+    jae .dedup_overwrite
+    mov ecx, 24
+    mul ecx
+    lea rdi, [dup_ts_buf + rax]
+    jmp .dedup_copy
+
+.dedup_overwrite:
+    ; Overwrite entry 0, shift others up by 1
+    push rsi
+    lea rdi, [rel dup_ts_buf]
+    lea rsi, [rel dup_ts_buf + 24]
+    mov ecx, 3 * 24
+    cld
+    rep movsb
+    pop rsi
+    lea rdi, [rel dup_ts_buf + 3 * 24]
+
+.dedup_copy:
+    mov [rdi], r13d            ; store length
+    mov rsi, r12
+    lea rdi, [rdi + 4]
+    mov ecx, r13d
+    cld
+    rep movsb
+    mov eax, [rel dup_ts_count]
+    cmp eax, 4
+    jae .dedup_count_done
+    inc eax
+    mov [rel dup_ts_count], eax
+.dedup_count_done:
+    jmp .cmd_lookup
+
+.dedup_skip:
+    ; Duplicate: acknowledge but skip command
+    push rax
+    push rdx
+    push rdi
+    push rsi
+    mov dil, 's'
+    call debug_putc
+    pop rsi
+    pop rdi
+    pop rdx
+    pop rax
+    mov rdi, [rsp + 64]        ; envelope_id ptr
+    mov esi, [rsp + 72]        ; envelope_id len
+    call slack_send_ack
+    xor eax, eax
+    jmp .done
+
+.cmd_lookup:
+    ; Look up command in cmd_table
+    xor r15d, r15d
+    mov r14d, [rel cmd_count]
+    test r14d, r14d
+    jz .events_done
+
+.at_lookup:
+    cmp r15d, r14d
+    jae .events_done
+    mov eax, r15d
+    mov ecx, cmd_entry_size
+    mul ecx
+    lea r12, [cmd_table + rax]
+    mov eax, [r12 + cmd_entry.name_len]
+    cmp eax, ebx
+    jne .at_next
+    mov rdi, [r12 + cmd_entry.name_ptr]
+    mov rsi, r9
+    mov ecx, ebx
+    cld
+    repe cmpsb
+    je .at_found
+
+.at_next:
+    inc r15d
+    jmp .at_lookup
+
+.at_found:
+    push rax
+    push rdx
+    push rdi
+    push rsi
+    mov dil, '('
+    call debug_putc
+    pop rsi
+    pop rdi
+    pop rdx
+    pop rax
+
+    ; Push handler_args pointer and call handler
+    lea rax, [rsp + 32]
+    push rax
+    mov rax, [r12 + cmd_entry.handler]
+    call rax
+    add rsp, 8
+    xor eax, eax
+    jmp .done
+
+.events_done:
+    push rax
+    push rdx
+    push rdi
+    push rsi
+    mov dil, 'X'
+    call debug_putc
+    pop rsi
+    pop rdi
+    pop rdx
+    pop rax
     xor eax, eax
     jmp .done
 

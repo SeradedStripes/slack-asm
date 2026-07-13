@@ -107,12 +107,23 @@ ping_handler:
     push rbx
     push r12
 
+    mov r8, [r10 + handler_args.thread_ts]
+    test r8, r8
+    jnz .ping_thread_ws
+
     mov rdi, [r10 + handler_args.envelope_id]
     mov esi, [r10 + handler_args.envelope_id_len]
     lea rdx, [rel msg_pong]
     mov ecx, msg_pong_len
     call slack_send_response
+    jmp .ping_done
 
+.ping_thread_ws:
+    lea rdx, [rel msg_pong]
+    mov ecx, msg_pong_len
+    call send_cpm_threaded
+
+.ping_done:
     pop r12
     pop rbx
     ret
@@ -123,12 +134,23 @@ meow_handler:
     push rbx
     push r12
 
+    mov r8, [r10 + handler_args.thread_ts]
+    test r8, r8
+    jnz .meow_thread_ws
+
     mov rdi, [r10 + handler_args.envelope_id]
     mov esi, [r10 + handler_args.envelope_id_len]
     lea rdx, [rel msg_meow]
     mov ecx, msg_meow_len
     call slack_send_response
+    jmp .meow_done
 
+.meow_thread_ws:
+    lea rdx, [rel msg_meow]
+    mov ecx, msg_meow_len
+    call send_cpm_threaded
+
+.meow_done:
     pop r12
     pop rbx
     ret
@@ -149,6 +171,11 @@ help_handler:
     mov r8, [r10 + handler_args.response_url]
     test r8, r8
     jnz .resp_url
+
+    ; Check for thread_ts (bot mention)
+    mov r8, [r10 + handler_args.thread_ts]
+    test r8, r8
+    jnz .help_thread_ws
 
     ; Fall back to WS response for non-slash-command events
     jmp .no_thread
@@ -194,6 +221,12 @@ help_handler:
     call slack_send_http_post
     jmp .done
 
+.help_thread_ws:
+    lea rdx, [rel msg_help_text]
+    mov ecx, msg_help_text_len
+    call send_cpm_threaded
+    jmp .done
+
 .no_thread:
     mov rdi, [r10 + handler_args.envelope_id]
     mov esi, [r10 + handler_args.envelope_id_len]
@@ -202,6 +235,80 @@ help_handler:
     call slack_send_response
 
 .done:
+    add rsp, 512
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; void send_cpm_threaded(const char *text, uint32_t text_len)
+; rdx = text ptr, ecx = text_len
+; Uses handler_args at r10 for channel_id, thread_ts, envelope_id
+; Sends WS ack first, then POSTs to chat.postMessage
+send_cpm_threaded:
+    cld
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 512
+
+    mov r12, rdx
+    mov r13d, ecx
+    mov r15, r10              ; save handler_args ptr in callee-saved r15
+
+    ; Acknowledge envelope via WebSocket
+    mov rdi, [r15 + handler_args.envelope_id]
+    mov esi, [r15 + handler_args.envelope_id_len]
+    call slack_send_ack
+
+    ; Build JSON body: {"channel":"CH","text":"TEXT","thread_ts":"TS"}
+    lea rdi, [rsp]
+
+    lea rsi, [rel cpm_prefix]
+    mov ecx, cpm_prefix_len
+    rep movsb
+
+    mov rsi, [r15 + handler_args.channel_id]
+    mov ecx, [r15 + handler_args.channel_id_len]
+    rep movsb
+
+    lea rsi, [rel cpm_mid1]
+    mov ecx, cpm_mid1_len
+    rep movsb
+
+    mov rsi, r12
+    mov ecx, r13d
+    rep movsb
+
+    lea rsi, [rel cpm_mid2]
+    mov ecx, cpm_mid2_len
+    rep movsb
+
+    mov rsi, [r15 + handler_args.thread_ts]
+    mov ecx, [r15 + handler_args.thread_ts_len]
+    rep movsb
+
+    lea rsi, [rel cpm_suffix]
+    mov ecx, cpm_suffix_len
+    rep movsb
+
+    mov rax, rdi
+    sub rax, rsp
+    mov r14d, eax
+
+    ; POST to chat.postMessage
+    lea rdi, [rel cpm_url]
+    mov esi, cpm_url_len
+    lea rdx, [rsp]
+    mov ecx, r14d
+    lea r8, [rel bot_token]
+    mov r9d, [rel bot_token_len]
+    call slack_send_http_post
+
     add rsp, 512
     pop r15
     pop r14
