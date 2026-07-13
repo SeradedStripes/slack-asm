@@ -6,6 +6,7 @@ default rel
 %define SYS_write  1
 %define SYS_open   2
 %define SYS_close  3
+%define SYS_nanosleep 35
 %define SYS_exit   60
 %define STDOUT     1
 %define O_RDONLY   0
@@ -177,20 +178,26 @@ _start:
 .go:
     mov r13, rax                ; token length
     xor ebp, ebp
+    xor r14d, r14d              ; retry count (0 = no initial delay)
+.reconnect:
+    mov edi, r14d
+    call sleep_backoff
     call main
-    mov edi, eax
-    mov eax, SYS_exit
-    syscall
+    inc r14d
+    jmp .reconnect
 
 .go_env:
     mov r12, rdi                ; token ptr from load_env_token
     mov r13, rsi                ; token len
     call load_bot_token
     xor ebp, ebp
+    xor r14d, r14d              ; retry count (0 = no initial delay)
+.reconnect_env:
+    mov edi, r14d
+    call sleep_backoff
     call main
-    mov edi, eax
-    mov eax, SYS_exit
-    syscall
+    inc r14d
+    jmp .reconnect_env
 
 main:
     push r12
@@ -1973,4 +1980,34 @@ pnum:
     add rsp, 24
     pop r12
     pop rbx
+    ret
+
+; Sleep for edi seconds using nanosleep
+sleep_seconds:
+    sub rsp, 16
+    mov [rsp], edi
+    mov qword [rsp + 8], 0
+    mov rdi, rsp
+    xor esi, esi
+    mov eax, SYS_nanosleep
+    syscall
+    add rsp, 16
+    ret
+
+; Exponential backoff: sleep for 1 << (edi - 1) seconds, capped at 30
+; edi = retry count (0 = return immediately)
+sleep_backoff:
+    test edi, edi
+    jz .sb_done
+    mov eax, 1
+    dec edi
+    mov ecx, edi
+    shl eax, cl
+    cmp eax, 30
+    jbe .sb_ok
+    mov eax, 30
+.sb_ok:
+    mov edi, eax
+    call sleep_seconds
+.sb_done:
     ret
