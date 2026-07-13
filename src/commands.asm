@@ -23,6 +23,7 @@ extern resp_body_suffix, resp_body_suffix_len
 def_slash_cmd ping, "ping", "pong", "Returns 'pong' in response."
 def_slash_cmd bing, "bing", "bong", "Returns 'bong' in response."
 def_slash_cmd meow, "meow", "meoww", "Meow back at you."
+def_slash_cmd shameless_plug, "shameless plug", "https://stardance.hackclub.com/projects/6658", "A shameless plug."
 
 ; ============================================================
 ; Complex commands
