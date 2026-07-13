@@ -45,7 +45,7 @@ endstruc
   str_%1_len: equ $ - str_%1
   msg_%1: db %3
   msg_%1_len: equ $ - msg_%1
-  help_%1: db "/slack-asm %2 - %4", 0x0A
+  help_%1: db "/slack-asm ", %2, " - ", %4, 0x0A
   help_%1_len: equ $ - help_%1
   section .text
   global %1_handler
@@ -82,7 +82,7 @@ endstruc
   section .rodata
   str_%1: db %2
   str_%1_len: equ $ - str_%1
-  help_%1: db "/slack-asm %2 - %3", 0x0A
+  help_%1: db "/slack-asm ", %2, " - ", %3, 0x0A
   help_%1_len: equ $ - help_%1
   section .text
   global %1_handler
