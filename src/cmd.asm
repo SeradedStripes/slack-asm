@@ -420,18 +420,10 @@ cmd_dispatch:
     pop rax
 
     ; rax = command text start, edx = remaining length
-    ; Parse first word as command name
-    xor ebx, ebx
+    ; Use full remaining text as command name (supports spaces)
     mov r9, rax             ; save command text ptr
     mov r8d, edx            ; save remaining length
-.at_scan_cmd:
-    cmp ebx, r8d
-    jae .at_parsed
-    cmp byte [r9 + rbx], ' '
-    je .at_parsed
-    inc ebx
-    jmp .at_scan_cmd
-.at_parsed:
+    mov ebx, r8d            ; command name length = full remaining text
     test ebx, ebx
     jz .events_done
 
@@ -869,16 +861,8 @@ cmd_dispatch:
     test r14d, r14d
     jz .not_cmd
 
-    ; Find first word in text (the subcommand name)
-    xor ebp, ebp
-.ns_scan:
-    cmp ebp, r14d
-    jae .ns_word
-    cmp byte [rbx + rbp], ' '
-    je .ns_word
-    inc ebp
-    jmp .ns_scan
-.ns_word:
+    ; Use full remaining text as the subcommand name (supports spaces)
+    mov ebp, r14d
     test ebp, ebp
     jz .not_cmd
 
