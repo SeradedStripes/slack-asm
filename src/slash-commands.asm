@@ -21,21 +21,21 @@ endstruc
 section .rodata
 str_ping:           db "ping"
 str_ping_len:       equ $ - str_ping
-str_bing:           db "bing"
-str_bing_len:       equ $ - str_bing
-str_help:           db "help"
-str_help_len:       equ $ - str_help
-str_meow:           db "meow"
-str_meow_len:       equ $ - str_meow
-
 msg_pong:           db "pong"
 msg_pong_len:       equ $ - msg_pong
 
+str_bing:           db "bing"
+str_bing_len:       equ $ - str_bing
 msg_bong:           db "bong"
 msg_bong_len        equ $ - msg_bong
 
+str_meow:           db "meow"
+str_meow_len:       equ $ - str_meow
 msg_meoww:           db "meoww"
 msg_meoww_len:       equ $ - msg_meoww
+
+str_help:           db "help"
+str_help_len:       equ $ - str_help
 
 msg_help_text:      db "Available commands:", 0x0A
                     db "/slack-asm help - Displays this help message.", 0x0A
