@@ -38,6 +38,11 @@ msg_help_text:      db "Available commands:", 0x0A
                     db "/slack-asm meow - Returns 'meoww' in response.", 0x0A
 msg_help_text_len:  equ $ - msg_help_text
 
+resp_body_prefix: db '{"response_type":"in_channel","text":"'
+resp_body_prefix_len: equ $ - resp_body_prefix
+resp_body_suffix: db '"}'
+resp_body_suffix_len: equ $ - resp_body_suffix
+
 resp_url_prefix:  db '{"response_type":"in_channel","thread_ts":"'
 resp_url_prefix_len: equ $ - resp_url_prefix
 resp_url_mid:     db '","text":"'
@@ -140,10 +145,15 @@ help_handler:
     push r15
     sub rsp, 512
 
-    mov r8, [r10 + handler_args.thread_ts]
+    ; Check if response_url is available (preferred for slash commands)
+    mov r8, [r10 + handler_args.response_url]
     test r8, r8
-    jz .no_thread
+    jnz .resp_url
 
+    ; Fall back to WS response for non-slash-command events
+    jmp .no_thread
+
+.resp_url:
     ; Send ack via WebSocket FIRST (must be within 3 seconds)
     mov [rsp], r10                ; save handler_args ptr (r10 is scratch)
     mov rdi, [r10 + handler_args.envelope_id]
@@ -151,51 +161,36 @@ help_handler:
     call slack_send_ack
     mov r10, [rsp]                ; restore handler_args ptr
 
-    ; Build chat.postMessage body on stack:
-    ; {"channel":"<id>","text":"<help>","thread_ts":"<ts>"}
+    ; Build JSON body for response_url:
+    ; {"response_type":"in_channel","text":"<help>"}
     lea rdi, [rsp]
 
-    lea rsi, [rel cpm_prefix]
-    mov ecx, cpm_prefix_len
+    lea rsi, [rel resp_body_prefix]
+    mov ecx, resp_body_prefix_len
     cld
-    rep movsb
-
-    mov rsi, [r10 + handler_args.channel_id]
-    mov ecx, [r10 + handler_args.channel_id_len]
-    rep movsb
-
-    lea rsi, [rel cpm_mid1]
-    mov ecx, cpm_mid1_len
     rep movsb
 
     lea rsi, [rel msg_help_text]
     mov ecx, msg_help_text_len
     rep movsb
 
-    lea rsi, [rel cpm_mid2]
-    mov ecx, cpm_mid2_len
+    lea rsi, [rel resp_body_suffix]
+    mov ecx, resp_body_suffix_len
     rep movsb
 
-    mov rsi, [r10 + handler_args.thread_ts]
-    mov ecx, [r10 + handler_args.thread_ts_len]
-    rep movsb
-
-    lea rsi, [rel cpm_suffix]
-    mov ecx, cpm_suffix_len
-    rep movsb
-
+    ; Calculate body length
     mov rbx, rdi
     lea rax, [rsp]
     sub rbx, rax
-    mov r14d, ebx            ; body length
+    mov r14d, ebx
 
-    ; POST to chat.postMessage API with bot token auth
-    lea rdi, [rel cpm_url]
-    mov esi, cpm_url_len
+    ; POST to response_url (URL is self-authenticating, no auth needed)
+    mov rdi, [r10 + handler_args.response_url]
+    mov esi, [r10 + handler_args.response_url_len]
     lea rdx, [rsp]
     mov ecx, r14d
-    lea r8, [rel bot_token]
-    mov r9d, [rel bot_token_len]
+    xor r8, r8          ; no auth value
+    xor r9d, r9d        ; no auth length
     call slack_send_http_post
     jmp .done
 

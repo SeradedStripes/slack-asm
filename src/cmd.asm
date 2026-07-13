@@ -490,7 +490,12 @@ cmd_dispatch:
     mov [rsp + 96], rax
     mov [rsp + 104], edx
 
-    ; thread_ts set from cache above (or NULL if no cached message ts)
+    ; Clear thread_ts for slash commands, we don't have the command's own ts,
+    ; and the cached ts from event_callback messages is unrelated.
+    xor eax, eax
+    mov [rsp + 80], rax
+    mov [rsp + 88], eax
+
     ; Determine dispatch mode: check if command is the namespace prefix
     ; (allow JSON-escaped "\/" prefix)
     mov eax, [rsp + 8]
