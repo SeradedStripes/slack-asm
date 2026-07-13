@@ -21,6 +21,8 @@ endstruc
 section .rodata
 str_ping:           db "ping"
 str_ping_len:       equ $ - str_ping
+str_bing:           db "bing"
+str_bing_len:       equ $ - str_bing
 str_help:           db "help"
 str_help_len:       equ $ - str_help
 str_meow:           db "meow"
@@ -29,13 +31,17 @@ str_meow_len:       equ $ - str_meow
 msg_pong:           db "pong"
 msg_pong_len:       equ $ - msg_pong
 
-msg_meow:           db "meoww"
-msg_meow_len:       equ $ - msg_meow
+msg_bong:           db "bong"
+msg_bong_len        equ $ - msg_bong
+
+msg_meoww:           db "meoww"
+msg_meoww_len:       equ $ - msg_meoww
 
 msg_help_text:      db "Available commands:", 0x0A
                     db "/slack-asm help - Displays this help message.", 0x0A
                     db "/slack-asm ping - Returns 'pong' in response.", 0x0A
                     db "/slack-asm meow - Returns 'meoww' in response.", 0x0A
+                    db "/slack-asm bing - Returns 'bong' in response.", 0x0A
 msg_help_text_len:  equ $ - msg_help_text
 
 resp_body_prefix: db '{"response_type":"in_channel","text":"'
@@ -62,7 +68,7 @@ cpm_suffix:      db '"}'
 cpm_suffix_len:  equ $ - cpm_suffix
 
 section .text
-global cmd_register_all, ping_handler, help_handler, meow_handler
+global cmd_register_all, ping_handler, help_handler, meow_handler, bing_handler
 
 extern cmd_register
 extern slack_send_response
@@ -81,6 +87,12 @@ cmd_register_all:
     lea rdi, [rel str_ping]
     mov esi, str_ping_len
     lea rdx, [rel ping_handler]
+    mov ecx, CMD_NAMESPACED
+    call cmd_register
+
+    lea rdi, [rel str_bing]
+    mov esi, str_bing_len
+    lea rdx, [rel bing_handler]
     mov ecx, CMD_NAMESPACED
     call cmd_register
 
@@ -128,6 +140,33 @@ ping_handler:
     pop rbx
     ret
 
+bing_handler:
+    mov r10, [rsp + 8]      ; handler_args ptr
+
+    push rbx
+    push r12
+
+    mov r8, [r10 + handler_args.thread_ts]
+    test r8, r8
+    jnz .bing_thread_ws
+
+    mov rdi, [r10 + handler_args.envelope_id]
+    mov esi, [r10 + handler_args.envelope_id_len]
+    lea rdx, [rel msg_bong]
+    mov ecx, msg_bong_len
+    call slack_send_response
+    jmp .bing_done
+
+.bing_thread_ws:
+    lea rdx, [rel msg_bong]
+    mov ecx, msg_bong_len
+    call send_cpm_threaded
+
+.bing_done:
+    pop r12
+    pop rbx
+    ret
+
 meow_handler:
     mov r10, [rsp + 8]      ; handler_args ptr
 
@@ -140,14 +179,14 @@ meow_handler:
 
     mov rdi, [r10 + handler_args.envelope_id]
     mov esi, [r10 + handler_args.envelope_id_len]
-    lea rdx, [rel msg_meow]
-    mov ecx, msg_meow_len
+    lea rdx, [rel msg_meoww]
+    mov ecx, msg_meoww_len
     call slack_send_response
     jmp .meow_done
 
 .meow_thread_ws:
-    lea rdx, [rel msg_meow]
-    mov ecx, msg_meow_len
+    lea rdx, [rel msg_meoww]
+    mov ecx, msg_meoww_len
     call send_cpm_threaded
 
 .meow_done:
