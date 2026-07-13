@@ -60,6 +60,8 @@ key_ts_len:         equ $ - key_ts
 
 event_callback_str: db "event_callback"
 event_callback_len: equ $ - event_callback_str
+str_app_mention:    db "app_mention"
+str_app_mention_len: equ $ - str_app_mention
 key_events_channel: db '"channel"'
 key_events_channel_len: equ $ - key_events_channel
 key_event_user:      db '"user"'
@@ -338,6 +340,14 @@ cmd_dispatch:
     pop rdi
 
 .done_events:
+    ; Only process app_mention events
+    mov rdi, r12
+    mov esi, r13d
+    lea rdx, [rel str_app_mention]
+    mov ecx, str_app_mention_len
+    call memmem
+    test eax, eax
+    jz .events_done
     ; ---- Bot mention detection (@slack-asm) ----
     push rax
     push rdx
