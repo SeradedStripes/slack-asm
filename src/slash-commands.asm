@@ -5,6 +5,49 @@ default rel
 %define WS_TEXT 0x1
 %define CMD_NAMESPACED 1
 
+; Macro: define a simple command that replies with a canned response
+; %1 = identifier prefix (e.g., ping -> str_ping, ping_handler, msg_ping)
+; %2 = command name string (e.g., "ping")
+; %3 = response text string (e.g., "pong")
+%macro def_slash_cmd 3
+  section .rodata
+  str_%1: db %2
+  str_%1_len: equ $ - str_%1
+  msg_%1: db %3
+  msg_%1_len: equ $ - msg_%1
+  section .text
+  global %1_handler
+  %1_handler:
+      mov r10, [rsp + 8]
+      push rbx
+      push r12
+      mov r8, [r10 + handler_args.thread_ts]
+      test r8, r8
+      jnz .%1_thread
+      mov rdi, [r10 + handler_args.envelope_id]
+      mov esi, [r10 + handler_args.envelope_id_len]
+      lea rdx, [rel msg_%1]
+      mov ecx, msg_%1_len
+      call slack_send_response
+      jmp .%1_done
+  .%1_thread:
+      lea rdx, [rel msg_%1]
+      mov ecx, msg_%1_len
+      call send_cpm_threaded
+  .%1_done:
+      pop r12
+      pop rbx
+      ret
+%endmacro
+
+%macro reg_slash_cmd 1
+  lea rdi, [rel str_%1]
+  mov esi, str_%1_len
+  lea rdx, [rel %1_handler]
+  mov ecx, CMD_NAMESPACED
+  call cmd_register
+%endmacro
+
 struc handler_args
     .channel_id      resq 1
     .channel_id_len  resq 1
@@ -18,22 +61,11 @@ struc handler_args
     .response_url_len resq 1
 endstruc
 
+def_slash_cmd ping, "ping", "pong"
+def_slash_cmd bing, "bing", "bong"
+def_slash_cmd meow, "meow", "meoww"
+
 section .rodata
-str_ping:           db "ping"
-str_ping_len:       equ $ - str_ping
-msg_pong:           db "pong"
-msg_pong_len:       equ $ - msg_pong
-
-str_bing:           db "bing"
-str_bing_len:       equ $ - str_bing
-msg_bong:           db "bong"
-msg_bong_len        equ $ - msg_bong
-
-str_meow:           db "meow"
-str_meow_len:       equ $ - str_meow
-msg_meoww:           db "meoww"
-msg_meoww_len:       equ $ - msg_meoww
-
 str_help:           db "help"
 str_help_len:       equ $ - str_help
 
@@ -68,7 +100,7 @@ cpm_suffix:      db '"}'
 cpm_suffix_len:  equ $ - cpm_suffix
 
 section .text
-global cmd_register_all, ping_handler, help_handler, meow_handler, bing_handler
+global cmd_register_all, help_handler
 
 extern cmd_register
 extern slack_send_response
@@ -79,22 +111,11 @@ extern slack_send_ack
 extern bot_token, bot_token_len
 extern debug_putc, debug_hexdump
 
-; Register all slash command handlers
-; Call once after cmd_init()
 cmd_register_all:
     push rbx
-
-    lea rdi, [rel str_ping]
-    mov esi, str_ping_len
-    lea rdx, [rel ping_handler]
-    mov ecx, CMD_NAMESPACED
-    call cmd_register
-
-    lea rdi, [rel str_bing]
-    mov esi, str_bing_len
-    lea rdx, [rel bing_handler]
-    mov ecx, CMD_NAMESPACED
-    call cmd_register
+    reg_slash_cmd ping
+    reg_slash_cmd bing
+    reg_slash_cmd meow
 
     lea rdi, [rel str_help]
     mov esi, str_help_len
@@ -102,95 +123,6 @@ cmd_register_all:
     mov ecx, CMD_NAMESPACED
     call cmd_register
 
-    lea rdi, [rel str_meow]
-    mov esi, str_meow_len
-    lea rdx, [rel meow_handler]
-    mov ecx, CMD_NAMESPACED
-    call cmd_register
-
-    pop rbx
-    ret
-
-; ping handler, replies with "pong"
-; Invoked as: /slack-asm ping [args...]
-ping_handler:
-    mov r10, [rsp + 8]      ; handler_args ptr
-
-    push rbx
-    push r12
-
-    mov r8, [r10 + handler_args.thread_ts]
-    test r8, r8
-    jnz .ping_thread_ws
-
-    mov rdi, [r10 + handler_args.envelope_id]
-    mov esi, [r10 + handler_args.envelope_id_len]
-    lea rdx, [rel msg_pong]
-    mov ecx, msg_pong_len
-    call slack_send_response
-    jmp .ping_done
-
-.ping_thread_ws:
-    lea rdx, [rel msg_pong]
-    mov ecx, msg_pong_len
-    call send_cpm_threaded
-
-.ping_done:
-    pop r12
-    pop rbx
-    ret
-
-bing_handler:
-    mov r10, [rsp + 8]      ; handler_args ptr
-
-    push rbx
-    push r12
-
-    mov r8, [r10 + handler_args.thread_ts]
-    test r8, r8
-    jnz .bing_thread_ws
-
-    mov rdi, [r10 + handler_args.envelope_id]
-    mov esi, [r10 + handler_args.envelope_id_len]
-    lea rdx, [rel msg_bong]
-    mov ecx, msg_bong_len
-    call slack_send_response
-    jmp .bing_done
-
-.bing_thread_ws:
-    lea rdx, [rel msg_bong]
-    mov ecx, msg_bong_len
-    call send_cpm_threaded
-
-.bing_done:
-    pop r12
-    pop rbx
-    ret
-
-meow_handler:
-    mov r10, [rsp + 8]      ; handler_args ptr
-
-    push rbx
-    push r12
-
-    mov r8, [r10 + handler_args.thread_ts]
-    test r8, r8
-    jnz .meow_thread_ws
-
-    mov rdi, [r10 + handler_args.envelope_id]
-    mov esi, [r10 + handler_args.envelope_id_len]
-    lea rdx, [rel msg_meoww]
-    mov ecx, msg_meoww_len
-    call slack_send_response
-    jmp .meow_done
-
-.meow_thread_ws:
-    lea rdx, [rel msg_meoww]
-    mov ecx, msg_meoww_len
-    call send_cpm_threaded
-
-.meow_done:
-    pop r12
     pop rbx
     ret
 
