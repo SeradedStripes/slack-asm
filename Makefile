@@ -1,5 +1,5 @@
 NASM := nasm
-NASMFLAGS := -f elf64
+NASMFLAGS := -f elf64 -I src/
 LD := ld
 
 .PHONY: all clean test run rsa_test gcm_test
@@ -14,7 +14,7 @@ slack: $(SLACK_OBJS)
 	$(LD) -o $@ $(SLACK_OBJS)
 
 # ---- Test runner ----
-CORE_SRCS := $(filter-out src/slack.asm src/test.asm src/gcm_test.asm src/prf_test.asm src/rsa_test.asm src/cmd.asm src/slash-commands.asm,$(wildcard src/*.asm))
+CORE_SRCS := $(filter-out src/slack.asm src/test.asm src/gcm_test.asm src/prf_test.asm src/rsa_test.asm src/cmd.asm src/slash-commands.asm src/commands.asm,$(wildcard src/*.asm))
 CORE_OBJS := $(patsubst src/%.asm,src/%.o,$(CORE_SRCS))
 
 TEST_SRCS := $(wildcard test/*.asm)
@@ -38,7 +38,7 @@ gcm_test: src/gcm_test.o src/gcm.o src/crypto.o
 	$(NASM) $(NASMFLAGS) -o $@ $<
 
 clean:
-	rm -f $(SLACK_OBJS) src/test.o src/cmd.o src/slash-commands.o slack test_runner
+	rm -f $(SLACK_OBJS) src/test.o src/cmd.o src/slash-commands.o src/commands.o slack test_runner
 	rm -f $(TEST_OBJS)
 	rm -f src/aes_test.o src/prf_test.o src/rsa_test.o src/gcm_test.o
 	rm -f rsa_test gcm_test aes_test httpbin_test
