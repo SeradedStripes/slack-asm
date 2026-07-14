@@ -38,6 +38,127 @@ def_delete_cmd shameless_plug, "shameless plug", "https://stardance.hackclub.com
 
 def_complex_cmd help, "help", "Displays this help message."
 
+def_complex_cmd pung, "pung", "Pings a user: Get punged {user} :bleh:"
+
+section .rodata
+pung_prefix: db "Get punged "
+pung_prefix_len: equ $ - pung_prefix
+pung_suffix: db " :bleh:"
+pung_suffix_len: equ $ - pung_suffix
+section .text
+
+pung_handler:
+    mov r10, [rsp + 8]
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 512
+    mov r15, r10
+
+    ; Save remaining text (passed in rsi/edx from dispatch)
+    mov r12, rsi
+    mov r13d, edx
+
+    mov r8, [r15 + handler_args.response_url]
+    test r8, r8
+    jnz .pung_resp_url
+
+    ; No response_url → WS or threaded
+    mov r8, [r15 + handler_args.thread_ts]
+    test r8, r8
+    jnz .pung_thread
+
+    ; WS response
+    lea rdi, [rsp]
+    lea rsi, [rel pung_prefix]
+    mov ecx, pung_prefix_len
+    cld
+    rep movsb
+    mov rsi, r12
+    mov ecx, r13d
+    rep movsb
+    lea rsi, [rel pung_suffix]
+    mov ecx, pung_suffix_len
+    rep movsb
+    mov rax, rdi
+    sub rax, rsp
+    mov r14d, eax
+
+    mov rdi, [r15 + handler_args.envelope_id]
+    mov esi, [r15 + handler_args.envelope_id_len]
+    lea rdx, [rsp]
+    mov ecx, r14d
+    call slack_send_response
+    jmp .pung_done
+
+.pung_thread:
+    lea rdi, [rsp]
+    lea rsi, [rel pung_prefix]
+    mov ecx, pung_prefix_len
+    cld
+    rep movsb
+    mov rsi, r12
+    mov ecx, r13d
+    rep movsb
+    lea rsi, [rel pung_suffix]
+    mov ecx, pung_suffix_len
+    rep movsb
+    mov rax, rdi
+    sub rax, rsp
+    mov r14d, eax
+
+    lea rdx, [rsp]
+    mov ecx, r14d
+    call send_cpm_threaded
+    jmp .pung_done
+
+.pung_resp_url:
+    ; Slash command: ack + POST replace_original with dynamic text
+    mov rdi, [r15 + handler_args.envelope_id]
+    mov esi, [r15 + handler_args.envelope_id_len]
+    call slack_send_ack
+
+    lea rdi, [rsp]
+    lea rsi, [rel delete_prefix]
+    mov ecx, delete_prefix_len
+    cld
+    rep movsb
+    lea rsi, [rel pung_prefix]
+    mov ecx, pung_prefix_len
+    rep movsb
+    mov rsi, r12
+    mov ecx, r13d
+    rep movsb
+    lea rsi, [rel pung_suffix]
+    mov ecx, pung_suffix_len
+    rep movsb
+    lea rsi, [rel delete_suffix]
+    mov ecx, delete_suffix_len
+    rep movsb
+
+    mov rax, rdi
+    sub rax, rsp
+    mov r14d, eax
+
+    mov rdi, [r15 + handler_args.response_url]
+    mov esi, [r15 + handler_args.response_url_len]
+    lea rdx, [rsp]
+    mov ecx, r14d
+    xor r8, r8
+    xor r9d, r9d
+    call slack_send_http_post
+
+.pung_done:
+    add rsp, 512
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
 help_handler:
     mov r10, [rsp + 8]
     push rbx

@@ -874,7 +874,7 @@ cmd_dispatch:
 
 .ns_loop:
     cmp r15d, r14d
-    jae .not_cmd
+    jae .ns_not_found
 
     mov eax, r15d
     mov ecx, cmd_entry_size
@@ -915,6 +915,29 @@ cmd_dispatch:
     inc rsi
     dec r14d
     jmp .ns_skip
+
+.ns_not_found:
+    ; Phase 2: first-word fallback (for commands with args like "pung <user>")
+    ; ebp = full text length (from phase 1), rbx = text start
+    mov r14d, [rsp + 24]        ; restore original text length
+    cmp ebp, r14d
+    jne .not_cmd                ; already tried first word → not found
+    xor ebp, ebp
+.ns_scan2:
+    cmp ebp, r14d
+    jae .not_cmd
+    cmp byte [rbx + rbp], ' '
+    je .ns_word2
+    inc ebp
+    jmp .ns_scan2
+.ns_word2:
+    test ebp, ebp
+    jz .not_cmd
+    xor r15d, r15d
+    mov r14d, [rel cmd_count]
+    test r14d, r14d
+    jz .not_cmd
+    jmp .ns_loop
 
 .ns_call:
     mov r13, rsi               ; save remaining text ptr (preserved across calls)
