@@ -17,6 +17,11 @@ resp_url_mid_len: equ $ - resp_url_mid
 resp_url_suffix:  db '"}'
 resp_url_suffix_len: equ $ - resp_url_suffix
 
+delete_prefix:   db '{"replace_original":true,"response_type":"in_channel","text":"'
+delete_prefix_len: equ $ - delete_prefix
+delete_suffix:   db '"}'
+delete_suffix_len: equ $ - delete_suffix
+
 cpm_url:         db "https://slack.com/api/chat.postMessage"
 cpm_url_len:     equ $ - cpm_url
 cpm_prefix:      db '{"channel":"'
@@ -37,6 +42,8 @@ global send_cpm_threaded
 global help_register, build_help_table
 global resp_body_prefix, resp_body_prefix_len
 global resp_body_suffix, resp_body_suffix_len
+global delete_prefix, delete_prefix_len
+global delete_suffix, delete_suffix_len
 
 extern slack_send_ack
 extern slack_send_http_post

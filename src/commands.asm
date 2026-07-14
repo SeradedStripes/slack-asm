@@ -15,6 +15,8 @@ extern help_register
 extern build_help_table
 extern resp_body_prefix, resp_body_prefix_len
 extern resp_body_suffix, resp_body_suffix_len
+extern delete_prefix, delete_prefix_len
+extern delete_suffix, delete_suffix_len
 
 ; ============================================================
 ; Simple commands
@@ -23,7 +25,12 @@ extern resp_body_suffix, resp_body_suffix_len
 def_slash_cmd ping, "ping", "pong", "Returns 'pong' in response."
 def_slash_cmd bing, "bing", "bong", "Returns 'bong' in response."
 def_slash_cmd meow, "meow", "meoww", "Meow back at you."
-def_slash_cmd shameless_plug, "shameless plug", "https://stardance.hackclub.com/projects/6658", "A shameless plug."
+
+; ============================================================
+; Commands where the slash command trigger should be deleted after execution
+; ============================================================
+
+def_delete_cmd shameless_plug, "shameless plug", "https://stardance.hackclub.com/projects/6658", "A shameless plug."
 
 ; ============================================================
 ; Complex commands
@@ -40,64 +47,29 @@ help_handler:
     push r15
     sub rsp, 512
 
+    ; Save handler_args in callee-saved r15
+    mov r15, r10
+
     ; Build help text into [rsp..rsp+255]
     lea rdi, [rsp]
     call build_help_table
     mov r12d, eax              ; help text length
 
     ; Decide reply channel
-    mov r8, [r10 + handler_args.response_url]
-    test r8, r8
-    jnz .resp_url
-    mov r8, [r10 + handler_args.thread_ts]
+    mov r8, [r15 + handler_args.thread_ts]
     test r8, r8
     jnz .thread_ws
 
-    ; WS response
-    mov rdi, [r10 + handler_args.envelope_id]
-    mov esi, [r10 + handler_args.envelope_id_len]
+    ; WS response (same pattern as def_slash_cmd, keeps original command)
+    mov rdi, [r15 + handler_args.envelope_id]
+    mov esi, [r15 + handler_args.envelope_id_len]
     lea rdx, [rsp]
     mov ecx, r12d
     call slack_send_response
     jmp .done
 
-.resp_url:
-    mov [rsp + 504], r10
-    mov rdi, [r10 + handler_args.envelope_id]
-    mov esi, [r10 + handler_args.envelope_id_len]
-    call slack_send_ack
-    mov r10, [rsp + 504]
-
-    ; Build JSON: {"response_type":"in_channel","text":"<help>"}
-    lea rdi, [rsp + 256]
-    lea rsi, [rel resp_body_prefix]
-    mov ecx, resp_body_prefix_len
-    cld
-    rep movsb
-
-    lea rsi, [rsp]
-    mov ecx, r12d
-    rep movsb
-
-    lea rsi, [rel resp_body_suffix]
-    mov ecx, resp_body_suffix_len
-    rep movsb
-
-    lea rax, [rsp + 256]
-    sub rdi, rax
-    mov r14d, edi
-
-    mov rdi, [r10 + handler_args.response_url]
-    mov esi, [r10 + handler_args.response_url_len]
-    lea rdx, [rsp + 256]
-    mov ecx, r14d
-    xor r8, r8
-    xor r9d, r9d
-    call slack_send_http_post
-    jmp .done
-
 .thread_ws:
-    mov rdx, rsp
+    lea rdx, [rsp]
     mov ecx, r12d
     call send_cpm_threaded
 

@@ -73,6 +73,93 @@ endstruc
   reg_entry %1
 %endmacro
 
+; Define a "delete original" command, slash command deletes itself,
+; leaving only the response visible. Falls back to normal response for
+; app_mention (where response_url is unavailable).
+; %1 = identifier prefix (e.g., shameless_plug)
+; %2 = command name string (e.g., "shameless plug")
+; %3 = response text string
+; %4 = help description string
+%macro def_delete_cmd 4
+  section .rodata
+  str_%1: db %2
+  str_%1_len: equ $ - str_%1
+  msg_%1: db %3
+  msg_%1_len: equ $ - msg_%1
+  help_%1: db "/slack-asm ", %2, " - ", %4, 0x0A
+  help_%1_len: equ $ - help_%1
+  section .text
+  global %1_handler
+  %1_handler:
+      push rbx
+      push r12
+      push r13
+      push r14
+      push r15
+      sub rsp, 512
+      mov r15, [rsp + 560]      ; handler_args ptr (past 5 pushes + ret addr)
+
+      mov r8, [r15 + handler_args.response_url]
+      test r8, r8
+      jz .%1_fallback
+
+      ; Slash command: ack, then POST delete_original + response to response_url
+      mov rdi, [r15 + handler_args.envelope_id]
+      mov esi, [r15 + handler_args.envelope_id_len]
+      call slack_send_ack
+
+      lea rdi, [rsp]
+      lea rsi, [rel delete_prefix]
+      mov ecx, delete_prefix_len
+      cld
+      rep movsb
+      lea rsi, [rel msg_%1]
+      mov ecx, msg_%1_len
+      rep movsb
+      lea rsi, [rel delete_suffix]
+      mov ecx, delete_suffix_len
+      rep movsb
+
+      mov rax, rdi
+      sub rax, rsp
+      mov r14d, eax
+
+      mov rdi, [r15 + handler_args.response_url]
+      mov esi, [r15 + handler_args.response_url_len]
+      lea rdx, [rsp]
+      mov ecx, r14d
+      xor r8, r8
+      xor r9d, r9d
+      call slack_send_http_post
+      jmp .%1_done
+
+  .%1_fallback:
+      ; app_mention: respond normally
+      mov r8, [r15 + handler_args.thread_ts]
+      test r8, r8
+      jnz .%1_thread
+      mov rdi, [r15 + handler_args.envelope_id]
+      mov esi, [r15 + handler_args.envelope_id_len]
+      lea rdx, [rel msg_%1]
+      mov ecx, msg_%1_len
+      call slack_send_response
+      jmp .%1_done
+  .%1_thread:
+      lea rdx, [rel msg_%1]
+      mov ecx, msg_%1_len
+      call send_cpm_threaded
+
+  .%1_done:
+      add rsp, 512
+      pop r15
+      pop r14
+      pop r13
+      pop r12
+      pop rbx
+      ret
+  reg_entry %1
+%endmacro
+
 ; Define a complex command with a custom handler.
 ; %1 = identifier (e.g., help -> str_help, help_handler)
 ; %2 = command name string (e.g., "help")
