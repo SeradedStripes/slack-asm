@@ -8,12 +8,12 @@ A slack bot written in pure x86_64 assembly!
 
 ### Features
 
-(These are only the currently implemented ones, see the [roadmap](roadmap.md) for the full plan)
-
-- Linux syscalls for networking (socket, connect, sendto, recvfrom).
-- TLS 1.2 record layer and handshake (ClientHello → ServerHello + Cert + ServerHelloDone).
-- SHA-256 and HMAC-SHA256 (all test vectors pass).
-- Probably Something else, lets be honest im only reupdating this list when its convenient for me.
+- a ping command (/slack-asm ping)
+- a bing command (/slack-asm bing)
+- a meow command (/slack-asm meow)
+- a shameless plug command (/slack-asm shameless plug)
+- a pung command (/slack-asm pung {user} [pings a person])
+- a help command (/slack-asm help) - tis a help command bro
 
 ### Cool Things
 
@@ -43,14 +43,6 @@ $ make
 - **OS:** Linux (x86_64)
 - **Syscall ABI:** `syscall` instruction, kernel calling convention
 - **Calling convention:** System V AMD64 (for any interop, though there shouldn't be any)
-
-## Running the bot
-
-Use the docker compose file..
-
-## Running the code without docker
-
-Run run.sh script or do ./slack directly.
 
 ## License
 
