@@ -135,6 +135,7 @@ ws_path_len: resq 1
 envbuf:     resb 4096           ; .env file read buffer
 envtoken:   resb 256            ; extracted token from .env
 envbuf_size: resq 1             ; bytes read into envbuf
+environ_ptr: resq 1             ; pointer to environ array from _start
 bot_token:   resb 256           ; bot token from .env (xoxb-...)
 bot_token_len: resd 1           ; bot token length
 fallback_ts: resb 32            ; temporary buffer for API-fetched ts
@@ -148,6 +149,9 @@ global _start
 
 _start:
     pop rcx                     ; argc
+    ; Save envp: after argv pointers + NULL terminator
+    lea rax, [rsp + rcx*8 + 8]
+    mov [rel environ_ptr], rax
     cmp ecx, 2
     jge .from_argv
 
@@ -155,6 +159,11 @@ _start:
     call load_env_token
     test eax, eax
     jnz .go_env
+
+    ; Try reading token from environment variables
+    call load_env_from_environ
+    test eax, eax
+    jnz .go_env_environ
 
 .usage:
     lea rsi, [tag_fail]
@@ -192,6 +201,15 @@ _start:
     call load_bot_token
     xor ebp, ebp
     xor r14d, r14d              ; retry count (0 = no initial delay)
+    jmp .reconnect_env
+
+.go_env_environ:
+    mov r12, rdi                ; token ptr from load_env_from_environ
+    mov r13, rsi                ; token len
+    ; bot_token/bot_token_len already populated by load_env_from_environ
+    xor ebp, ebp
+    xor r14d, r14d              ; retry count (0 = no initial delay)
+
 .reconnect_env:
     mov edi, r14d
     call sleep_backoff
@@ -1168,6 +1186,125 @@ load_bot_token:
     add rbx, rcx
     sub r9, rcx
     jmp .lbt_loop
+
+; Load SLACK_TOKEN and SLACK_BOT_TOKEN from process environment
+; Scans the environ pointer array saved by _start.
+; Returns: eax=1 success (rdi=envtoken, rsi=len), eax=0 failure
+load_env_from_environ:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov r15, [rel environ_ptr]
+    test r15, r15
+    jz .lfe_fail
+
+    mov rbx, r15                 ; save environ base for phase 2
+    xor r12d, r12d              ; r12 = token length (0 = not found)
+
+    ; Phase 1: find SLACK_TOKEN=
+.lfe_scan_token:
+    mov r13, [r15]
+    test r13, r13
+    jz .lfe_scan_bot
+
+    cmp dword [r13], 'SLAC'
+    jne .lfe_next_token
+    cmp dword [r13 + 4], 'K_TO'
+    jne .lfe_next_token
+    cmp dword [r13 + 8], 'KEN='
+    jne .lfe_next_token
+
+    ; Found SLACK_TOKEN=, copy value to envtoken
+    lea r8, [r13 + 12]
+    xor ecx, ecx
+.lfe_tlen:
+    cmp byte [r8 + rcx], 0
+    je .lfe_tcopy
+    inc ecx
+    jmp .lfe_tlen
+.lfe_tcopy:
+    test ecx, ecx
+    jz .lfe_next_token
+    cmp ecx, 255
+    jbe .lfe_tcopy2
+    mov ecx, 255
+.lfe_tcopy2:
+    mov r12d, ecx
+    cld
+    lea rdi, [envtoken]
+    mov rsi, r8
+    rep movsb
+    mov byte [rdi], 0
+
+.lfe_next_token:
+    add r15, 8
+    jmp .lfe_scan_token
+
+.lfe_scan_bot:
+    mov r15, rbx
+.lfe_bot_loop:
+    mov r13, [r15]
+    test r13, r13
+    jz .lfe_done
+
+    cmp dword [r13], 'SLAC'
+    jne .lfe_next_bot
+    cmp dword [r13 + 4], 'K_BO'
+    jne .lfe_next_bot
+    cmp dword [r13 + 8], 'T_TO'
+    jne .lfe_next_bot
+    cmp word [r13 + 12], 'KE'
+    jne .lfe_next_bot
+    cmp byte [r13 + 14], 'N'
+    jne .lfe_next_bot
+    cmp byte [r13 + 15], '='
+    jne .lfe_next_bot
+
+    lea r8, [r13 + 16]
+    xor ecx, ecx
+.lfe_blen:
+    cmp byte [r8 + rcx], 0
+    je .lfe_bcopy
+    inc ecx
+    jmp .lfe_blen
+.lfe_bcopy:
+    test ecx, ecx
+    jz .lfe_next_bot
+    cmp ecx, 255
+    jbe .lfe_bcopy2
+    mov ecx, 255
+.lfe_bcopy2:
+    mov [rel bot_token_len], ecx
+    cld
+    lea rdi, [bot_token]
+    mov rsi, r8
+    rep movsb
+    mov byte [rdi], 0
+
+.lfe_next_bot:
+    add r15, 8
+    jmp .lfe_bot_loop
+
+.lfe_done:
+    test r12d, r12d
+    jz .lfe_fail
+    lea rdi, [envtoken]
+    mov esi, r12d
+    mov eax, 1
+    jmp .lfe_ret
+
+.lfe_fail:
+    xor eax, eax
+.lfe_ret:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
 
 ; Hex dump, rsi = data, edx = length
 hex_dump:
