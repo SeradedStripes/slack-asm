@@ -6,6 +6,8 @@ A Slack bot written in **pure x86_64 Linux assembly**, no C, no Rust, no libc.
 
 A slack bot written in pure x86_64 assembly!
 
+(ARM support very very soon btw)
+
 ### Features
 
 - a ping command (/slack-asm ping)
