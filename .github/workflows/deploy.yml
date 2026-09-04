@@ -1,0 +1,27 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to Coolify
+        uses: SeradedStripes/coolify-deploy@v1.1
+        with:
+          coolify_url: 'https://coolify.kirze.de'
+          coolify_app_uuid: ''
+          coolify_token: ${{ secrets.COOLIFY_TOKEN }}
+          build_image: 'true'
+          build_image_name: 'slack-asm'
+          build_image_tag: 'latest'
+          build_image_registry: 'ghcr.io/seradedstripes'
+          registry_token: ${{ secrets.GITHUB_TOKEN }}
+          build_context: '.'
