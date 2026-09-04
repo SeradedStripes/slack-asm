@@ -17,7 +17,7 @@ jobs:
         uses: SeradedStripes/coolify-deploy@v1.1
         with:
           coolify_url: 'https://coolify.kirze.de'
-          coolify_app_uuid: 'ghcr.io/seradedstripes/slack-asm'
+          coolify_app_uuid: '02pde3h3bjlkkdsniqyahewz'
           coolify_token: ${{ secrets.COOLIFY_TOKEN }}
           build_image: 'true'
           build_image_name: 'slack-asm'
